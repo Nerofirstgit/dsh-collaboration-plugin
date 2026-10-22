@@ -15,8 +15,8 @@ import {ALLOWED_PROFILE_ENTRIES} from '../../src/host/profile.ts'
 
 export async function installDetachedAuditedInventory(ctx:Context,dir:string,workspaceRoot:string):Promise<void>{
   mkdirSync(join(dir,'node_modules','@nerofirstgit'),{recursive:true})
-  symlinkSync(resolve('node_modules/@deepseek-ai'),join(dir,'node_modules','@deepseek-ai'),'dir')
-  symlinkSync(resolve('.'),join(dir,'node_modules','@nerofirstgit','dsh-collaboration'),'dir')
+  symlinkSync(resolve('node_modules/@deepseek-ai'),join(dir,'node_modules','@deepseek-ai'),process.platform==='win32'?'junction':'dir')
+  symlinkSync(resolve('.'),join(dir,'node_modules','@nerofirstgit','dsh-collaboration'),process.platform==='win32'?'junction':'dir')
   ctx.baseUrl=pathToFileURL(join(dir,'anchor.js')).href
   await ctx.plugin(Loader,{baseUrl:ctx.baseUrl});await ctx.plugin(PluginPackages)
   await ctx.plugin(ProtectedFileSystem,{cwd:workspaceRoot})

@@ -1,5 +1,7 @@
 # Mandatory acceptance matrix — 65 cases
 
+> Latest portable/GUI component changes: [candidate contract](gui-candidate.md). Windows native execution, actual packed GUI boot and two-process transport remain unaccepted. Historical Linux-only/external-actor entries below must be evaluated under the explicit [scope revision](scope-revision.md); neither larger component counts nor simulations mark all 65 complete.
+
 **No complete in-scope mandatory acceptance case is signed off by this matrix.** The requirement calls for at least two real Harness processes, deterministic concurrency barriers and failure injection. Component tests, real `AgentLoop` objects inside one Node process, and short-lived storage/writer subprocesses provide useful evidence but do not replace that run.
 
 Target: official DeepSeek Harness commit `687f282e8625c6b8d11ff58211a90524be2e4317` (`0.2.1-rc.2`), cloud Linux, Node 24.19.0. No live/paid model API or user-machine execution was used. Scenario IDs and meanings come from [the supplied requirements](REQUIREMENTS.zh.md).

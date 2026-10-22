@@ -205,3 +205,18 @@ test('F07 real rename tool requires a prior source read before acquiring any cla
     assert.equal(f.methods.includes('claim_files'),false)
   }finally{await f.close()}
 })
+
+test('runtime status reports cooperating scope and unfinished Windows/GUI gates instead of promising protection',async()=>{
+  const f=await fixture('session_collaboration_status',{})
+  try{
+    f.a.followup(prompt('report actual compatibility'));await f.a.whenIdle()
+    const result=toolResult(f)!;assert.equal(result.isError,false,JSON.stringify(result))
+    const block=result.content.find(b=>b.type==='text')!;assert.equal(block.type,'text')
+    const status=JSON.parse(block.text).data
+    assert.equal(status.cooperation_scope,'participating-enabled-dsh-sessions')
+    assert.equal(status.external_program_prevention,false)
+    assert.equal(status.writer_capabilities.native_windows_acceptance,'pending')
+    assert.equal(status.gui_integration,'not-selected')
+    assert.equal(status.write_protection,'unsupported-unverified-profile')
+  }finally{await f.close()}
+})

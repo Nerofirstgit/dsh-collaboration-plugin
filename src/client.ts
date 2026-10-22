@@ -4,9 +4,11 @@ import { CoordinationError, ERROR_CODES } from './errors.ts'
 import type { ErrorCode } from './errors.ts'
 import type { RuntimeIdentity } from './types.ts'
 import { record } from './util.ts'
+import { canonicalExistingDirectory } from './platform/resource-paths.ts'
+import { COOPERATION_PROTOCOL } from './protocol.ts'
 
-export interface ClientOptions { socket_path:string; admin_token:string; timeout_ms?:number }
-/** Narrow deterministic test seam. Production always uses node:net Unix sockets. */
+export interface ClientOptions { socket_path:string; admin_token:string; timeout_ms?:number; requiredProtocol?:number }
+/** Narrow deterministic test seam. Production uses node:net over the selected Unix socket or Windows named pipe. */
 export interface ClientSocket {
   readonly destroyed:boolean
   setEncoding(encoding:BufferEncoding):unknown
@@ -24,13 +26,19 @@ interface PendingRequest {
 interface Connection {
   socket:ClientSocket; opening:Promise<void>; resolveOpen:()=>void; rejectOpen:(error:Error)=>void
   connected:boolean; retired:boolean; buffer:string; pending:Map<string,PendingRequest>
+  verifiedProtocol?:number; reservedRootsKey?:string; preparing?:Promise<void>; preparationError?:Error
 }
 
 /** Private runtime transport. It never automatically replays an unknown request. */
 export class CoordinatorClient {
   private current?:Connection
-  readonly options:ClientOptions
-  constructor(options:ClientOptions,private readonly socketFactory:ClientSocketFactory=path=>connect(path)) { this.options=options }
+  private hostStateRoots?:readonly string[]
+  private readonly socketFactory:ClientSocketFactory
+  readonly options:Readonly<ClientOptions>
+  constructor(options:ClientOptions,socketFactory:ClientSocketFactory=path=>connect(path)) {
+    if(options.requiredProtocol!==undefined&&(!Number.isSafeInteger(options.requiredProtocol)||options.requiredProtocol<1))throw new CoordinationError('INVALID_ARGUMENT','requiredProtocol must be a positive protocol version.')
+    this.options=Object.freeze({...options});this.socketFactory=socketFactory
+  }
 
   private unknown(id:string,method:string,reason:string):CoordinationError {
     return new CoordinationError('OUTCOME_UNKNOWN',reason,{
@@ -96,15 +104,83 @@ export class CoordinatorClient {
     if(connection.retired||connection.socket.destroyed||this.current!==connection)throw new CoordinationError('COORDINATOR_UNAVAILABLE','Coordinator connection changed before request dispatch.')
     return connection
   }
-  async open():Promise<void> { await this.acquire() }
+  private assertLive(connection:Connection):void {
+    if(connection.retired||connection.socket.destroyed||this.current!==connection)throw new CoordinationError('COORDINATOR_UNAVAILABLE','Coordinator connection changed before request dispatch; no bytes were written.')
+  }
+  private requiredProtocol():number|undefined { return this.options.requiredProtocol??(this.hostStateRoots?COOPERATION_PROTOCOL:undefined) }
+  private rootsKey():string|undefined { return this.hostStateRoots?JSON.stringify(this.hostStateRoots):undefined }
+  private prepared(connection:Connection):boolean {
+    this.assertLive(connection)
+    if(connection.preparationError)throw connection.preparationError
+    return connection.verifiedProtocol===this.requiredProtocol()&&connection.reservedRootsKey===this.rootsKey()
+  }
+  private incompatible(message:string,details:Record<string,unknown>={}):CoordinationError {
+    return new CoordinationError('UNMEDIATED_WRITE_DENIED',message,{
+      ...details,
+      recovery_action:'Keep GUI state writers and participating sessions stopped. Update the shared coordinator to the same collaboration protocol, or correct its durable host-state reservation, then explicitly reconnect. Do not spawn a competing daemon or ignore this gate.',
+    })
+  }
+  /** Internal dispatch deliberately bypasses public call/acquire, avoiding recursive readiness waits. */
+  private prepare(connection:Connection):Promise<void> {
+    if(connection.preparing)return connection.preparing
+    const promise=(async()=>{
+      const required=this.requiredProtocol()
+      if(required!==undefined&&connection.verifiedProtocol!==required) {
+        const response=await this.send(connection,'ping',{},undefined,true)
+        this.assertLive(connection)
+        if(typeof response!=='object'||response===null||Array.isArray(response)||!('cooperation_protocol' in response)||response.cooperation_protocol!==required)throw this.incompatible('Shared coordinator does not implement the required collaboration protocol; GUI state and session writes remain disabled.',{required_protocol:required})
+        connection.verifiedProtocol=required
+      }
+      // The initial root requirement may arrive while the protocol proof is in flight.
+      const roots=this.hostStateRoots,key=this.rootsKey()
+      if(roots&&connection.reservedRootsKey!==key) {
+        if(roots.some(root=>canonicalExistingDirectory(root)!==root))throw this.incompatible('Canonical Harness state roots changed; readiness must be re-established explicitly.')
+        const response=await this.send(connection,'reserve_host_state_roots',{roots:[...roots]},undefined,true)
+        this.assertLive(connection)
+        if(typeof response!=='object'||response===null||Array.isArray(response)||!('roots' in response)||!Array.isArray(response.roots)||response.roots.length!==roots.length||response.roots.some((root,index)=>typeof root!=='string'||root!==roots[index]))throw this.incompatible('Coordinator did not acknowledge exactly the retained canonical Harness state roots; GUI readiness remains blocked.')
+        connection.reservedRootsKey=key
+      }
+    })()
+    connection.preparing=promise
+    // Observe failures without making a second rejected promise. A failed proof
+    // poisons only this generation, until an explicit close/reconnect.
+    void promise.then(()=>{if(connection.preparing===promise)connection.preparing=undefined},error=>{
+      connection.preparationError=error instanceof Error?error:this.incompatible('Coordinator readiness could not be established.')
+      if(connection.preparing===promise)connection.preparing=undefined
+    })
+    return promise
+  }
+  async open():Promise<void> {
+    const connection=await this.acquire()
+    while(!this.prepared(connection))await this.prepare(connection)
+  }
+  /** Trusted GUI setup: roots are immutable, and every replacement connection re-reserves them. */
+  async ensureHostStateRoots(roots:string[]):Promise<{roots:string[]}> {
+    if(!Array.isArray(roots)||roots.length<1||roots.length>64||roots.some(root=>typeof root!=='string'))throw new CoordinationError('INVALID_ARGUMENT','roots must contain 1–64 existing absolute Harness state directories.')
+    const canonicalRoots=Object.freeze([...new Set(roots.map(root=>canonicalExistingDirectory(root)))].sort())
+    if(this.options.requiredProtocol!==undefined&&this.options.requiredProtocol!==COOPERATION_PROTOCOL)throw this.incompatible('This client protocol cannot guarantee durable Harness state-root reservations.')
+    if(this.hostStateRoots&&JSON.stringify(this.hostStateRoots)!==JSON.stringify(canonicalRoots))throw this.incompatible('Harness state roots cannot change for an established client; use a separately admitted profile/client.')
+    // Set before the first await, so concurrent ordinary calls cannot pass this gate.
+    this.hostStateRoots??=canonicalRoots
+    const connection=await this.acquire()
+    while(!this.prepared(connection))await this.prepare(connection)
+    return{roots:[...this.hostStateRoots]}
+  }
   async call(method:string,params:Record<string,unknown>={},identity?:RuntimeIdentity):Promise<unknown> {
     let connection:Connection
     try { connection=await this.acquire() }
     catch(error) { throw new CoordinationError('COORDINATOR_UNAVAILABLE','Cannot connect to the shared coordinator; no request was dispatched and writes remain disabled.') }
+    while(!this.prepared(connection))await this.prepare(connection)
+    return this.send(connection,method,params,identity)
+  }
+  private send(connection:Connection,method:string,params:Record<string,unknown>,identity?:RuntimeIdentity,setup=false):Promise<unknown> {
     const id=randomUUID()
     // Serialization happens before adding a pending request or writing bytes.
     const wire=JSON.stringify({id,method,params,identity,admin_token:this.options.admin_token})+'\n'
-    if(connection.retired||connection.socket.destroyed||this.current!==connection)throw new CoordinationError('COORDINATOR_UNAVAILABLE','Coordinator connection changed before request dispatch; no bytes were written.')
+    this.assertLive(connection)
+    // Serialization may invoke user-supplied toJSON: recheck without an await
+    // immediately before dispatch, rather than using a stale readiness proof.
+    if(!setup&&!this.prepared(connection))throw this.incompatible('Readiness changed during request serialization; the ordinary request was not dispatched.')
     return new Promise((resolve,reject)=>{
       const timer=setTimeout(()=>{
         const item=connection.pending.get(id);if(!item)return

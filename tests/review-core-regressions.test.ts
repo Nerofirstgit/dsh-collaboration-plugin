@@ -82,7 +82,8 @@ test('REGRESSION: protected registration refuses state physically inside workspa
   const dataDir=join(alias,'state'),store=new Store(join(dataDir,'db.sqlite'))
   let lock:InstanceLock|undefined
   try{
-    lock=await InstanceLock.acquire(dataDir)
+    // The portable bootstrap now refuses ancestor aliases even before identity admission.
+    await assert.rejects(InstanceLock.acquire(dataDir),{code:'PATH_NOT_ALLOWED'})
     assert.equal(realpathSync(dataDir),join(root,'state'))
     const ids=new Identities(store,resolveConfig({data_dir:dataDir}))
     assert.throws(()=>ids.register({session_id:'review-session',cwd:root}),{code:'PATH_NOT_ALLOWED'})

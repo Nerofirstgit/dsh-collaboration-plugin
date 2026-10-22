@@ -1,12 +1,14 @@
-/** Installable Cordis adapter. Only the verified enabled headless profile may write. */
+/** Installable Cordis adapter. Only a verified enabled host composition may write. */
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import type { ToolDefinition,ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import { HarnessError } from '@deepseek-ai/dsh-llm'
 import type {} from '@deepseek-ai/dsh-user-approval'
-import { isAbsolute, relative, resolve } from 'node:path'
+import { resolve } from 'node:path'
 import { connectCoordinator } from './bootstrap.ts'
+import {CoordinatorClient} from './client.ts'
+import { writerCapabilities } from './writer.ts'
 import { resolveConfig } from './config.ts'
 import type { Config as CoordinatorConfig,RuntimeIdentity } from './types.ts'
 import { CoordinationError,ERROR_CODES,failure,success } from './errors.ts'
@@ -16,16 +18,19 @@ import { CoordinationSessionPersistence } from './host/persistence.ts'
 import type { HostCoordinatorTransport } from './host/persistence.ts'
 import { applyHostRuntime } from './host/runtime.ts'
 import { mountClaimManager } from './host/claims.ts'
+import { renameClaimGroup } from './host/claim-mapping.ts'
 import type { ManagedClaim } from './host/claims.ts'
 import { checkActiveProfile } from './host/profile.ts'
 import type { ProfileEvidence } from './host/profile.ts'
+import {checkActiveGuiProfile,guiStateRootsGuard,type GuiProfileEvidence} from './host/gui-profile.ts'
+import {createGuiSessionAdmission} from './host/gui-admission.ts'
 
-declare module '@deepseek-ai/cordis' {interface Context {collaborationReady:{readonly ready:true}}}
-export interface PluginConfig extends Partial<CoordinatorConfig> {workspace_root?:string;read_limit_lines?:number;read_output_bytes?:number}
+import type {} from './host/readiness.ts'
+export interface PluginConfig extends Partial<CoordinatorConfig> {workspace_root?:string;read_limit_lines?:number;read_output_bytes?:number;profile_mode?:'headless'|'gui';gui_surface?:'web'|'desktop'}
 export const name='session-collaboration'
 export const inject=['tools','sessions','agents','sessionProjections','fs','loader','pluginPackages']
 export const Config:z<PluginConfig>=z.object({
-  enabled:z.boolean().default(true),workspace_root:z.string().default(process.cwd()),data_dir:z.string(),
+  enabled:z.boolean().default(true),workspace_root:z.string(),data_dir:z.string(),profile_mode:z.union(['headless','gui']).default('headless'),gui_surface:z.union(['web','desktop']),
   communication_policy:z.union(['explicit_only','same_project_enabled']).default('explicit_only'),
   heartbeat_ms:z.number().default(10000),offline_ms:z.number().default(45000),lease_ttl_ms:z.number().default(60000),auto_renew:z.boolean().default(true),
   message_limit_bytes:z.number().default(8192),mailbox_limit_bytes:z.number().default(10485760),injection_budget:z.number().default(2000),
@@ -42,26 +47,45 @@ export async function apply(ctx:Context,input:PluginConfig={}):Promise<void>{
   if(input.enabled===false)throw new CoordinationError('UNMEDIATED_WRITE_DENIED','This bundle replaces the host filesystem and persistence services. Stop this profile and deselect the complete bundle to disable it; a partial config toggle is not a runnable profile. Disabled-plugin collaboration is outside the supported guarantee.')
   const config=resolveConfig(input),client=await connectCoordinator(config)
   ctx.effect(()=>()=>client.close())
-  mount(ctx,client,input,()=>checkActiveProfile(ctx))
+  await mount(ctx,client,input,()=>input.profile_mode==='gui'?checkActiveGuiProfile(ctx):checkActiveProfile(ctx))
 }
-/** Explicit composition helper for host component tests; production always uses the private Unix transport. */
-export function applyWithClient(ctx:Context,client:HostCoordinatorTransport,input:PluginConfig={}):void {
-  mount(ctx,client,input,ctx.get('loader')?()=>checkActiveProfile(ctx):undefined)
+/** Explicit composition helper for host component tests; production always uses the original private Node IPC transport. */
+export function applyWithClient(ctx:Context,client:HostCoordinatorTransport,input:PluginConfig={}):void|Promise<void> {
+  return mount(ctx,client,input,input.profile_mode==='gui'?()=>checkActiveGuiProfile(ctx):ctx.get('loader')?()=>checkActiveProfile(ctx):undefined)
 }
-function mount(ctx:Context,client:HostCoordinatorTransport,input:PluginConfig,profileChecker?:(()=>ProfileEvidence)):void {
-  const config=resolveConfig(input),workspaceRoot=resolve(input.workspace_root??process.cwd())
+type EnabledProfileEvidence=ProfileEvidence|GuiProfileEvidence
+function mount(ctx:Context,client:HostCoordinatorTransport,input:PluginConfig,profileChecker?:(()=>EnabledProfileEvidence)):void|Promise<void> {
+  if(input.profile_mode!==undefined&&!['headless','gui'].includes(input.profile_mode))throw new CoordinationError('INVALID_ARGUMENT','Unknown collaboration host profile mode.')
+  const gui=input.profile_mode==='gui'
+  if(gui&&input.gui_surface!=='web'&&input.gui_surface!=='desktop')throw new CoordinationError('INVALID_ARGUMENT','GUI mode requires the explicit web or desktop host surface.')
+  let admissionComplete=false,disposed=false
+  ctx.effect(()=>()=>{disposed=true;admissionComplete=false})
+  const config=resolveConfig(input),workspaceRoot=input.workspace_root===undefined?undefined:resolve(input.workspace_root)
   const readLines=integer(input.read_limit_lines??200,'read_limit_lines',1,10000),readBytes=integer(input.read_output_bytes??16384,'read_output_bytes',128,1048576)
-  const persistence=new CoordinationSessionPersistence(ctx,client,{workspaceRoot})
+  const persistence=new CoordinationSessionPersistence(ctx,client,{workspaceRoot,...gui?{admitSession:request=>{
+    if(!admissionComplete)throw new CoordinationError('UNMEDIATED_WRITE_DENIED','GUI startup has not reserved its host-state roots yet.')
+    // Recheck the actual live controller guard too: its fiber can stop while a
+    // previously admitted stock create is awaiting mkdir/workspace preparation.
+    verifyProfile()
+    createGuiSessionAdmission(guiStateRootsGuard(ctx))(request)
+  }}:{}})
   const runtime=applyHostRuntime(ctx,client,persistence,{heartbeatMs:config.heartbeat_ms,injectionBudget:config.injection_budget})
   const receipts=new Map<string,Receipt>(),owned=new Set<ToolDefinition>()
   const claims=mountClaimManager(ctx,client,{autoRenew:config.auto_renew,heartbeatMs:config.heartbeat_ms,leaseTtlMs:config.lease_ttl_ms,identityFor(id){const agent=ctx.agents.get(SessionId(id));if(!agent)throw new CoordinationError('STALE_INSTANCE','The claim owner is no longer active.');return runtime.identity(agent)},onError(id,error){ctx.logger.warn(`Collaboration lease renewal paused for ${id}: ${error instanceof Error?error.message:String(error)}`)}})
-  let profile:ProfileEvidence|undefined
-  function verifyProfile():void {if(!profileChecker)return;const current=profileChecker();if(profile&&profile.fingerprint!==current.fingerprint)throw new CoordinationError('UNMEDIATED_WRITE_DENIED','The enabled profile changed after verification. Restart the audited composition before continuing.');profile=current}
+  let profile:EnabledProfileEvidence|undefined
+  function verifyProfile(startup=false):void {
+    if(disposed||gui&&!startup&&!admissionComplete)throw new CoordinationError('UNMEDIATED_WRITE_DENIED','The collaboration profile is not ready or has stopped.')
+    if(!profileChecker)return
+    const current=profileChecker()
+    if(gui&&(current.profile!=='pinned-cooperative-gui'||current.surface!==input.gui_surface))throw new CoordinationError('UNMEDIATED_WRITE_DENIED','Configured GUI surface differs from the actual launcher.')
+    if(profile&&profile.fingerprint!==current.fingerprint)throw new CoordinationError('UNMEDIATED_WRITE_DENIED','The enabled profile changed after verification. Restart the audited composition before continuing.')
+    profile=current
+  }
   const key=(id:RuntimeIdentity,path:string)=>id.session_id+'\0'+path
   function identity(exec:ToolRunContext):RuntimeIdentity {if(!exec.agent)throw new CoordinationError('STALE_INSTANCE','This tool requires an active host session.');return runtime.identity(exec.agent)}
   async function writable<T>(exec:ToolRunContext,run:()=>Promise<T>):Promise<T> {
     verifyProfile()
-    if(!profile)throw new CoordinationError('UNMEDIATED_WRITE_DENIED','Managed writes require the verified pinned minimal headless profile. This component composition supports discovery, messages and reads only; it does not prove enabled workspace protection.',{recovery_action:'Install the complete bundle in the pinned headless profile and restart. Do not enable raw filesystem, shell, MCP or plugin fallbacks.'})
+    if(!profile||!admissionComplete)throw new CoordinationError('UNMEDIATED_WRITE_DENIED','Managed writes require a verified pinned host profile and completed startup admission. This component composition alone does not prove enabled workspace protection.',{recovery_action:'Use the complete reviewed composition and restart. Do not enable raw filesystem, shell, MCP or plugin fallbacks.'})
     identity(exec);return run()
   }
   function tool(toolName:string,description:string,parameters:Record<string,unknown>,run:(args:Record<string,unknown>,exec:ToolRunContext)=>Promise<unknown>):void {
@@ -92,7 +116,7 @@ function mount(ctx:Context,client:HostCoordinatorTransport,input:PluginConfig,pr
   tool('session_mark_message_handled','Explicitly acknowledge or resolve a received message; never grants other actions.',{message_id:s('Message ID',true),action:{type:'string',enum:['acknowledge','resolve'],required:true},resolution:s('Required nonempty conclusion when resolving')},rpc('mark_message_handled'))
   tool('session_poll_events','Query visible events independently of automatic context delivery.',{cursor:s('Bound event cursor'),limit:n('1–100; default 20'),wait_ms:n('0–30000'),scope:{type:'string',enum:['same_workspace','same_project']}},rpc('poll_events'))
   tool('session_get_coordination_snapshot','Read a consistent paged collaboration snapshot and its event watermark.',{cursor:s('Snapshot continuation'),limit:n('1–100; default 20'),scope:{type:'string',enum:['same_workspace','same_project']}},rpc('get_coordination_snapshot'))
-  tool('session_collaboration_status','Show actual enabled-profile verification and incomplete acceptance status.',{},async()=>({enabled:true,host_version:'0.2.1-rc.2',write_protection:profile?'verified-enabled-profile-component-contract':'unsupported-unverified-profile',profile,platform:process.platform,communication_policy:config.communication_policy,limitations:['Full two-process P0 acceptance is not complete.','Only audited enabled headless participants are covered; unmediated tools are denied.','Disabled plugins, human external processes and arbitrary installed host code are outside this guarantee.']}))
+  tool('session_collaboration_status','Show actual enabled-profile verification and incomplete acceptance status.',{},async()=>({enabled:true,host_version:'0.2.1-rc.2',write_protection:profile?'verified-enabled-profile-component-contract':'unsupported-unverified-profile',profile:profile??null,platform:process.platform,cooperation_scope:'participating-enabled-dsh-sessions',external_program_prevention:false,writer_capabilities:writerCapabilities(),gui_integration:gui?'enabled-component-candidate-native-acceptance-pending':'not-selected',communication_policy:config.communication_policy,limitations:['Full two-process P0 acceptance is not complete.','Only audited enabled participants are covered; unmediated tools are denied. Native Windows and real GUI acceptance remain pending.','Disabled plugins, human external processes and arbitrary installed host code are outside this guarantee.']}))
   tool('claim_files','Atomically claim all listed ordinary files; nonblocking and never a content-version guarantee.',{paths:{...list('Workspace-relative ordinary files'),required:true},purpose:s('Why this task needs the files',true),request_id:s('Stable idempotency ID',true),ttl_ms:n('Lease TTL')},async(args,exec)=>writable(exec,async()=>{const id=identity(exec);try{const result=record(await client.call('claim_files',args,id));if(Array.isArray(result.claims))claims.record(id,result.claims as ManagedClaim[],{ttlMs:args.ttl_ms===undefined?config.lease_ttl_ms:integer(args.ttl_ms,'ttl_ms',1,3600000)});return result}catch(error){if(error instanceof CoordinationError&&error.code==='FILE_BUSY')claims.conflict(id.session_id);throw error}}))
   tool('release_files','Release current owned claims; does not reset fencing counters.',{lease_ids:{...list('Opaque lease IDs'),required:true},request_id:s('Stable idempotency ID',true)},async(args,exec)=>writable(exec,async()=>{const id=identity(exec),result=await client.call('release_files',args,id);if(Array.isArray(args.lease_ids))claims.forget(id.session_id,args.lease_ids as string[]);return result}))
   tool('read','Read exact UTF-8 file bytes with full SHA-256 and a receipt for the displayed range. A truncated read cannot authorize whole-file replacement. For a long line, continue at the returned byte_range.end using byte_start/byte_end instead of line offsets.',{file_path:s('Workspace-relative ordinary text file',true),offset:n('1-based first line; default 1'),limit:n('Maximum lines; default 200'),byte_start:n('Optional inclusive byte offset; requires byte_end, excludes offset/limit'),byte_end:n('Optional exclusive byte offset; requires byte_start, excludes offset/limit')},async(args,exec)=>{
@@ -106,14 +130,10 @@ function mount(ctx:Context,client:HostCoordinatorTransport,input:PluginConfig,pr
   async function change(exec:ToolRunContext,path:string,fields:Record<string,unknown>):Promise<unknown>{return writable(exec,async()=>{
     const id=identity(exec)
     if(fields.operation==='rename'){
-      const target=string(fields.target_path,'target_path'),status=record(await client.call('get_session_status',{session_id:id.session_id},id)),root=string(record(status.session).workspace,'workspace')
-      const canonicalPath=(value:string)=>isAbsolute(value)?relative(root,value):value
+      const target=string(fields.target_path,'target_path')
       let result:Record<string,unknown>
       try{result=record(await client.call('claim_files',{paths:[path,target],purpose:'Managed ordinary-file rename',request_id:runtime.operationId(exec)+':claim'},id))}catch(error){if(error instanceof CoordinationError&&error.code==='FILE_BUSY')claims.conflict(id.session_id);throw error}
-      if(!Array.isArray(result.claims))throw new CoordinationError('STORAGE_ERROR','Rename claim group is missing.')
-      const group=result.claims as ManagedClaim[],source=group.find(c=>c.path===canonicalPath(path)),destination=group.find(c=>c.path===canonicalPath(target))
-      if(!source||!destination||source===destination)throw new CoordinationError('INVALID_ARGUMENT','Rename requires distinct source and destination claims.')
-      if(source.active===false||destination.active===false)throw new CoordinationError('LEASE_EXPIRED','Original rename claim group is no longer active; do not replay an uncertain rename.')
+      const {group,source,destination}=renameClaimGroup(result,path,target)
       claims.record(id,group,{explicit:false})
       return client.call('apply_file_change',{path,...fields,lease_id:source.lease_id,coordinator_epoch:source.coordinator_epoch,fencing_token:source.fencing_token,target_lease_id:destination.lease_id,target_fencing_token:destination.fencing_token,mutation_id:runtime.operationId(exec)},id)
     }
@@ -133,6 +153,26 @@ function mount(ctx:Context,client:HostCoordinatorTransport,input:PluginConfig,pr
   ctx.on('agent/pre-step',(_request,next)=>{verifyProfile();return next()})
   ctx.on('llm/stream',(_request,next)=>{verifyProfile();return next()})
   ctx.on('agent/disposed',({agent})=>{for(const k of receipts.keys())if(k.startsWith(agent.id+'\0'))receipts.delete(k)})
-  verifyProfile()
-  ctx.provide('collaborationReady',{ready:true})
+  verifyProfile(true)
+  function publishReady():void {
+    if(disposed)throw new CoordinationError('COORDINATOR_UNAVAILABLE','The profile stopped during startup admission.')
+    verifyProfile(true)
+    const guard=gui?guiStateRootsGuard(ctx):undefined
+    admissionComplete=true
+    try{ctx.provide('collaborationReady',{ready:true,...guard?{gui:{state_fingerprint:guard.evidence.fingerprint,assertWorkspacePathAllowed:(path:string)=>guard.assertWorkspacePathAllowed(path)}}:{}})}catch(error){admissionComplete=false;throw error}
+  }
+  if(gui){
+    const guard=guiStateRootsGuard(ctx),root=guard.evidence.home
+    // State providers and UI consumers are blocked on readiness. Reserve their
+    // state domain against EVERY participating profile, not only local sessions.
+    // Production retains and re-establishes the reservation on every transport generation.
+    // In-process component transports exercise the same coordinator RPC explicitly.
+    const reservation=client instanceof CoordinatorClient?client.ensureHostStateRoots([root]):client.call('reserve_host_state_roots',{roots:[root]})
+    return reservation.then(value=>{
+      const roots=record(value).roots
+      if(!Array.isArray(roots)||roots.length!==1||roots[0]!==root)throw new CoordinationError('STORAGE_ERROR','Coordinator did not confirm the exact GUI host-state root reservation. Restart compatible components; no UI state writer was admitted.')
+      guard.assertUnchanged();publishReady()
+    })
+  }
+  publishReady()
 }

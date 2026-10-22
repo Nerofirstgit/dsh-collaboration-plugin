@@ -1,5 +1,7 @@
 # Capability parity and deliberate differences
 
+> **2026-10-22 correction in progress:** native Windows and portable Node APIs are the target; only cooperating enabled dsh sessions are in scope. The current implementation and remaining Windows/GUI gates are in [portable-checkpoint.md](portable-checkpoint.md). Linux-specific descriptions and old test counts below are historical, not claims about the correction.
+
 This project ports the requested P0 collaboration semantics into **DeepSeek Harness**, not the internal implementation or UI of another assistant. The real host owns agent loops, models, tool execution and session events. The private daemon is a plugin service, not a separate assistant application.
 
 The latest user scope limits protection to the plugin **enabled in its supported audited profile**. Disabled/unloaded behavior is not guaranteed. Unknown same-process plugins are trusted host code outside the supported composition, not magically sandboxed workers. See [scope revision](scope-revision.md).

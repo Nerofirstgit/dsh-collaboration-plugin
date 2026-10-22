@@ -1,7 +1,8 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtempSync,mkdirSync,symlinkSync,rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import os, { tmpdir } from 'node:os'
+import {syncBuiltinESMExports} from 'node:module'
 import { join } from 'node:path'
 import { execFileSync } from 'node:child_process'
 import { Store } from '../src/store.ts'
@@ -16,6 +17,12 @@ test('D02 worktrees share common-dir project but not ordinary source lock identi
 test('M20 listing cursor cannot change caller or filter',()=>{const f=setup();try{const a=f.identities.register({session_id:'a',cwd:f.root});const b=f.identities.register({session_id:'b',cwd:f.root});const c=f.identities.list(a,{limit:1}).next_cursor!;assert.throws(()=>f.identities.list(b,{limit:1,cursor:c}),{code:'PERMISSION_REQUIRED'});assert.throws(()=>f.identities.list(a,{limit:1,cursor:c,include_offline:true}),{code:'PERMISSION_REQUIRED'})}finally{f.close()}})
 
 test('L02 reserved machine-instance control directory cannot belong to a protected workspace',()=>{
- const directory=mkdtempSync('/tmp/dsh-control-boundary-'),store=new Store(':memory:')
- try{const identities=new Identities(store,resolveConfig({data_dir:process.cwd()}));assert.throws(()=>identities.register({session_id:'broad-root',cwd:directory,project_root:'/tmp'}),{code:'PATH_NOT_ALLOWED'});assert.equal(store.db.prepare('SELECT COUNT(*) n FROM workspaces').get()!.n,0)}finally{store.close();rmSync(directory,{recursive:true,force:true})}
+ const directory=mkdtempSync(join(tmpdir(),'dsh-control-boundary-')),home=join(directory,'test-account'),store=new Store(':memory:'),original=os.userInfo
+ mkdirSync(home)
+ try{
+  os.userInfo=(()=>({...original(),homedir:home})) as typeof os.userInfo;syncBuiltinESMExports()
+  const identities=new Identities(store,resolveConfig({data_dir:process.cwd()}))
+  assert.throws(()=>identities.register({session_id:'broad-root',cwd:home}),{code:'PATH_NOT_ALLOWED'})
+  assert.equal(store.db.prepare('SELECT COUNT(*) n FROM workspaces').get()!.n,0)
+ }finally{os.userInfo=original;syncBuiltinESMExports();store.close();rmSync(directory,{recursive:true,force:true})}
 })

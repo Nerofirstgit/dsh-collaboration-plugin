@@ -1,7 +1,9 @@
-/** Linux-only trusted single-daemon writer. No client receives direct filesystem authority. */
+/** Single-daemon Node writer for participating dsh sessions, not an external-process filesystem sandbox. */
 import { constants, openSync, closeSync, fstatSync, lstatSync, readSync, writeSync, fsyncSync, mkdirSync, fchmodSync, renameSync, unlinkSync, linkSync, rmdirSync } from 'node:fs';
 import type { BigIntStats } from 'node:fs';
-import { isAbsolute, relative } from 'node:path';
+import { join } from 'node:path';
+import { normalizeManagedPath,resolveManagedPath,validateManagedPathInput } from './writer-paths.ts';
+export { normalizeManagedPath } from './writer-paths.ts';
 import { randomUUID } from 'node:crypto';
 import { Store } from './store.ts';
 import type { Config, RuntimeIdentity, SessionRow, WorkspaceRow } from './types.ts';
@@ -40,6 +42,16 @@ export interface Claim {
     fencing_token: number;
     expires_at: string;
     active?: boolean;
+}
+export interface ClaimPathMapping {
+    requested_path:string;
+    path:string;
+    lease_id:string;
+}
+export interface ClaimResult {
+    claims:Claim[];
+    /** Missing only for historical cached results; never guess an absent mapping. */
+    path_mappings?:ClaimPathMapping[];
 }
 export interface StructuredPatch {
     start: number;
@@ -133,7 +145,40 @@ interface MutationRow {
     error: string | null;
     created_at: number;
 }
-const INFO_FLAGS = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
+const INFO_FLAGS = constants.O_RDONLY;
+/**
+ * libuv v1.52.1 win/fs.c fs__sync_impl calls FlushFileBuffers; Microsoft
+ * documents GENERIC_WRITE as required. O_RDWR failure is not bypassed.
+ * https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-flushfilebuffers
+ */
+export function renameSourceFlushFlags(platform:NodeJS.Platform=process.platform):number {
+    return platform==='win32'?constants.O_RDWR:constants.O_RDONLY;
+}
+/** An implementation declaration, never a claim that native Windows acceptance ran. */
+export function writerCapabilities(platform:NodeJS.Platform=process.platform) {
+    return {
+        scope:'participating-dsh-sessions',file_flush:'node-fsync',
+        directory_flush:platform==='win32'?'unavailable-via-node-windows':'node-directory-fsync',
+        failure_model:'process-crash-recovery',power_loss:'not-certified',
+        native_windows_acceptance:'pending',windows_case_aliases:'canonical-components-and-conservative-missing-parent',
+        windows_mutations:'implementation-candidate',
+        external_program_prevention:false,
+    } as const;
+}
+/** Directory flush is not exposed uniformly by Node. Never equate file fsync with directory durability. */
+function flushDirectory(path:string):void {
+    if(process.platform==='win32')return;
+    const fd=openSync(path,constants.O_RDONLY);
+    try{fsyncSync(fd);}finally{closeSync(fd);}
+}
+function preservePermissions(fd:number,mode:number):void {
+    // POSIX rwx bits are not Windows ACLs. Windows uses the directory's inherited policy.
+    if(process.platform!=='win32')fchmodSync(fd,mode);
+}
+/** Guard for candidate writes/recovery; never initializes or rehashes legacy identities. */
+export function requireWriterIdentityScheme(store:Store,platform:NodeJS.Platform=process.platform):void {
+    if(platform==='win32'&&store.db.prepare("SELECT value FROM metadata WHERE key='windows_identity_scheme'").get()?.value!=='canonical-components-v1')fail('STORAGE_ERROR','Windows managed writes and recovery require canonical-components-v1 workspace identities.',{capabilities:writerCapabilities(platform),recovery_action:'Fresh identities must be registered through the canonical workspace resolver. Preserve existing history and use an audited offline migration for legacy identities; do not reset the domain or bypass this check.'});
+}
 function fsCode(error: unknown): string | undefined {
     return error instanceof Error && 'code' in error ? String(error.code) : undefined;
 }
@@ -169,14 +214,9 @@ function mutationRow(value: unknown): MutationRow | undefined {
         fail('STORAGE_ERROR', 'Invalid persisted mutation state.');
     return value as MutationRow;
 }
-function resourceKey(root: string, path: string): string {
-    if (typeof path !== 'string' || path.length === 0 || !path.isWellFormed() || path.includes('\0'))
-        fail('PATH_NOT_ALLOWED', 'Invalid file path.');
-    const candidate = isAbsolute(path) ? relative(root, path) : path, segments = candidate.split('/');
-    if (segments.some(s => s === '' || s === '.' || s === '..' || s === '.git' || s.startsWith('.dsh-collab-')) || isAbsolute(candidate))
-        fail('PATH_NOT_ALLOWED', 'Path escapes the workspace or names an unsupported reserved resource.');
-    return segments.join('/');
-}
+function resolvedPath(root:string,path:string) {return resolveManagedPath(root,path,{allowMissingLeaf:true});}
+function resourceKey(root:string,path:string):string {return resolvedPath(root,path).relative;}
+function parentKey(path:string):string {return path.split('/').slice(0,-1).join('/');}
 function version(bytes: Uint8Array): string {
     return 'sha256:' + digest(bytes);
 }
@@ -276,124 +316,97 @@ function regularSnapshot(path: string, maximum: number, maximumLinks = 1): Snaps
             closeSync(fd);
     }
 }
-/** Descriptor chain pins every parent; managed directory/link operations are never exposed. */
+/**
+ * Retain Node path/identity snapshots while the sole dsh writer owns execution.
+ * Checks detect ordinary namespace changes; they do not confine other programs.
+ * No supported model tool creates/replaces directories or links.
+ */
 class AnchoredPath {
-    readonly key: string;
-    readonly target: string;
-    readonly parent: string;
-    readonly leaf: string;
-    private readonly descriptors: number[] = [];
-    private readonly identities: FileInfo[] = [];
-    private readonly segments: string[];
-    private readonly root: string;
-    constructor(root: string, path: string) {
-        if (process.platform !== 'linux')
-            fail('UNSUPPORTED_PLATFORM', 'Protected writer currently requires Linux /proc/self/fd and O_NOFOLLOW.');
-        this.root = root;
-        this.key = resourceKey(root, path);
-        const segments = this.key.split('/');
-        this.segments = segments.slice(0, -1);
-        this.leaf = segments.at(-1)!;
-        try {
-            const fd = openSync(root, INFO_FLAGS | constants.O_DIRECTORY);
-            this.descriptors.push(fd);
-            this.identities.push(info(fstatSync(fd, { bigint: true })));
-            for (const segment of this.segments) {
-                const next = openSync(`/proc/self/fd/${this.descriptors.at(-1)!}/${segment}`, INFO_FLAGS | constants.O_DIRECTORY);
-                this.descriptors.push(next);
-                this.identities.push(info(fstatSync(next, { bigint: true })));
+    readonly key:string;
+    readonly target:string;
+    readonly parent:string;
+    readonly leaf:string;
+    private readonly parents:string[]=[];
+    private readonly identities:FileInfo[]=[];
+    constructor(root:string,path:string) {
+        const resolved=resolvedPath(root,path);
+        this.key=resolved.relative;
+        const segments=this.key.split('/');
+        this.leaf=segments.at(-1)!;
+        this.parents.push(resolved.root);
+        for(const segment of segments.slice(0,-1))this.parents.push(join(this.parents.at(-1)!,segment));
+        this.parent=this.parents.at(-1)!;
+        this.target=join(this.parent,this.leaf);
+        try{
+            for(const directory of this.parents){
+                const entry=lstatSync(directory,{bigint:true});
+                if(!entry.isDirectory())fail('PATH_NOT_ALLOWED','Managed parents must be existing ordinary directories without links.');
+                this.identities.push(info(entry));
             }
-            this.parent = `/proc/self/fd/${this.descriptors.at(-1)!}`;
-            this.target = `${this.parent}/${this.leaf}`;
             this.revalidate();
-        }
-        catch (error) {
-            this.close();
-            if (error instanceof CoordinationError)
-                throw error;
-            fail('PATH_NOT_ALLOWED', 'Parent paths must be existing ordinary directories without links.', { cause: fsCode(error) ?? String(error) });
+        }catch(error){
+            if(error instanceof CoordinationError)throw error;
+            fail('PATH_NOT_ALLOWED','Parent paths must be existing ordinary directories without links.',{cause:fsCode(error)??String(error)});
         }
     }
-    revalidate(): void {
-        try {
-            const root = lstatSync(this.root, { bigint: true });
-            if (!root.isDirectory() || !sameInode(info(root), this.identities[0]!))
-                fail('PATH_NOT_ALLOWED', 'Workspace root changed during the operation.');
-            for (let i = 0; i < this.segments.length; i++) {
-                const current = lstatSync(`/proc/self/fd/${this.descriptors[i]!}/${this.segments[i]!}`, { bigint: true });
-                if (!current.isDirectory() || !sameInode(info(current), this.identities[i + 1]!))
-                    fail('PATH_NOT_ALLOWED', 'A parent directory changed during the operation.');
+    revalidate():void {
+        try{
+            for(let index=0;index<this.parents.length;index++){
+                const entry=lstatSync(this.parents[index]!,{bigint:true});
+                if(!entry.isDirectory()||!sameInode(info(entry),this.identities[index]!))fail('PATH_NOT_ALLOWED','Managed parent namespace changed during the operation.');
             }
-        }
-        catch (error) {
-            if (error instanceof CoordinationError)
-                throw error;
-            fail('PATH_NOT_ALLOWED', 'Parent namespace changed during the operation.');
+        }catch(error){
+            if(error instanceof CoordinationError)throw error;
+            fail('PATH_NOT_ALLOWED','Managed parent namespace changed during the operation.');
         }
     }
-    snapshot(maximum: number, maximumLinks = 1): Snapshot | null {
+    snapshot(maximum:number,maximumLinks=1):Snapshot|null {
         this.revalidate();
-        const snapshot = regularSnapshot(this.target, maximum, maximumLinks);
+        const snapshot=regularSnapshot(this.target,maximum,maximumLinks);
         this.revalidate();
         return snapshot;
     }
-    flush(): void {
-        fsyncSync(this.descriptors.at(-1)!);
-    }
-    get parentFd():number{return this.descriptors.at(-1)!;}
+    flush():void{this.revalidate();flushDirectory(this.parent);}
     get parentInfo():FileInfo{return this.identities.at(-1)!;}
-    close(): void {
-        for (const fd of this.descriptors.splice(0).reverse())
-            closeSync(fd);
-    }
+    close():void{/* No directory FD needs lifetime ownership in the cooperative Node path backend. */}
 }
-/** A private artifact directory is pinned and identity-checked just like target parents. */
+/** Per-operation artifacts retain exact identity evidence; cleanup never follows a substituted entry. */
 class ArtifactDirectory {
-    readonly entry: string;
-    readonly path: string;
-    readonly identity: FileInfo;
-    private readonly fd: number;
-    constructor(anchor: AnchoredPath, name: string, expected: FileInfo | null, create = false) {
-        this.entry = `${anchor.parent}/${name}`;
-        if (create)
-            mkdirSync(this.entry, { mode: 0o700 });
-        this.fd = openSync(this.entry, INFO_FLAGS | constants.O_DIRECTORY);
-        try {
-            this.identity = info(fstatSync(this.fd, { bigint: true }));
-            if (expected !== null && !sameInode(expected, this.identity))
-                fail('PATH_NOT_ALLOWED', 'Recovery artifact identity changed.');
-            this.path = `/proc/self/fd/${this.fd}`;
-            this.revalidate();
-            if (create)
-                fchmodSync(this.fd, 0o700);
-        }
-        catch (error) {
-            closeSync(this.fd);
-            throw error;
-        }
+    readonly entry:string;
+    readonly path:string;
+    readonly identity:FileInfo;
+    constructor(anchor:AnchoredPath,name:string,expected:FileInfo|null,create=false){
+        anchor.revalidate();
+        this.entry=join(anchor.parent,name);
+        if(create)mkdirSync(this.entry,{mode:0o700});
+        const current=lstatSync(this.entry,{bigint:true});
+        if(!current.isDirectory())fail('PATH_NOT_ALLOWED','Recovery artifact is not an ordinary directory.');
+        this.identity=info(current);
+        if(expected!==null&&!sameInode(expected,this.identity))fail('PATH_NOT_ALLOWED','Recovery artifact identity changed.');
+        this.path=this.entry;
+        this.revalidate();
     }
-    revalidate(): void {
-        const current = lstatSync(this.entry, { bigint: true });
-        if (!current.isDirectory() || !sameInode(info(current), this.identity))
-            fail('PATH_NOT_ALLOWED', 'Recovery artifact namespace changed.');
+    revalidate():void {
+        const current=lstatSync(this.entry,{bigint:true});
+        if(!current.isDirectory()||!sameInode(info(current),this.identity))fail('PATH_NOT_ALLOWED','Recovery artifact namespace changed.');
     }
-    flush(): void {
-        fsyncSync(this.fd);
-    }
-    close(): void {
-        closeSync(this.fd);
-    }
+    flush():void{this.revalidate();flushDirectory(this.path);}
+    close():void{/* No retained directory descriptor. */}
 }
-/** SQLite intents and fencing remain inside the process holding the coordinator OS instance lock. */
+/** SQLite intents and fencing remain inside the elected coordinator’s exclusive instance ownership. */
 export class Writer {
     readonly store: Store;
     private readonly maximum: number;
     private readonly ttl: number;
     private readonly held = new Set<string>();
+    private readonly conservativeNamespace:boolean;
     /** Test-only failure injection. Production composition never exposes it to model tools or RPC. */
     fault: ((point: FaultPoint) => void) | undefined;
-    constructor(store: Store, config: Partial<Config> = {}) {
+    constructor(store: Store, config: Partial<Config> = {}, seam:{conservativeNamespace?:true}={}) {
         this.store = store;
+        // Internal test seam can only ADD the conservative policy on other
+        // platforms. Neither user configuration nor RPC can turn it off on Windows.
+        this.conservativeNamespace=process.platform==='win32'||seam.conservativeNamespace===true;
         this.maximum = config.max_read_bytes ?? 8 * 1024 * 1024;
         this.ttl = config.lease_ttl_ms ?? 60000;
         integer(this.maximum, 'max_read_bytes', 1, 128 * 1024 * 1024);
@@ -402,7 +415,15 @@ export class Writer {
       CREATE TABLE IF NOT EXISTS writer_leases(lease_id TEXT PRIMARY KEY,workspace_id TEXT NOT NULL,resource_key TEXT NOT NULL,owner_session_id TEXT NOT NULL,owner_incarnation_id TEXT NOT NULL,execution_epoch INTEGER NOT NULL,coordinator_epoch INTEGER NOT NULL,fencing_token INTEGER NOT NULL,expires_mono REAL NOT NULL,expires_at INTEGER NOT NULL,active INTEGER NOT NULL);
       CREATE INDEX IF NOT EXISTS writer_lease_resources ON writer_leases(workspace_id,resource_key,active);
       CREATE TABLE IF NOT EXISTS writer_requests(session_id TEXT NOT NULL,request_id TEXT NOT NULL,request_fingerprint TEXT NOT NULL,result TEXT NOT NULL,PRIMARY KEY(session_id,request_id));
-      CREATE TABLE IF NOT EXISTS file_mutations(mutation_id TEXT NOT NULL,workspace_id TEXT NOT NULL,session_id TEXT NOT NULL,incarnation_id TEXT NOT NULL,coordinator_epoch INTEGER NOT NULL,request_fingerprint TEXT NOT NULL,operation TEXT NOT NULL,resource_key TEXT NOT NULL,request TEXT NOT NULL,state TEXT NOT NULL,evidence TEXT NOT NULL,original_result TEXT,error TEXT,created_at INTEGER NOT NULL,PRIMARY KEY(workspace_id,session_id,mutation_id));`);
+      CREATE TABLE IF NOT EXISTS file_mutations(mutation_id TEXT NOT NULL,workspace_id TEXT NOT NULL,session_id TEXT NOT NULL,incarnation_id TEXT NOT NULL,coordinator_epoch INTEGER NOT NULL,request_fingerprint TEXT NOT NULL,operation TEXT NOT NULL,resource_key TEXT NOT NULL,request TEXT NOT NULL,state TEXT NOT NULL,evidence TEXT NOT NULL,original_result TEXT,error TEXT,created_at INTEGER NOT NULL,PRIMARY KEY(workspace_id,session_id,mutation_id));
+      CREATE TABLE IF NOT EXISTS writer_namespace_claims(lease_id TEXT PRIMARY KEY REFERENCES writer_leases(lease_id),parent_key TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS writer_namespace_intents(workspace_id TEXT NOT NULL,parent_key TEXT NOT NULL,session_id TEXT NOT NULL,mutation_id TEXT NOT NULL,PRIMARY KEY(workspace_id,parent_key,session_id,mutation_id));
+      CREATE TABLE IF NOT EXISTS writer_claim_inputs(session_id TEXT NOT NULL,request_id TEXT NOT NULL,paths TEXT NOT NULL,PRIMARY KEY(session_id,request_id));
+      CREATE TABLE IF NOT EXISTS writer_mutation_inputs(workspace_id TEXT NOT NULL,session_id TEXT NOT NULL,mutation_id TEXT NOT NULL,path TEXT NOT NULL,target_path TEXT,PRIMARY KEY(workspace_id,session_id,mutation_id));`);
+        if(this.conservativeNamespace)this.store.transaction(()=>{
+            if(this.store.db.prepare('SELECT 1 FROM file_mutations LIMIT 1').get()!==undefined)requireWriterIdentityScheme(this.store);
+            for(const raw of this.store.db.prepare("SELECT * FROM file_mutations WHERE state IN ('prepared','applied','needs_recovery')").all())this.rememberNamespaceIntent(mutationRow(raw)!);
+        });
     }
     private context(identity: RuntimeIdentity): {
         session: SessionRow;
@@ -461,6 +482,27 @@ export class Writer {
         const owner=this.store.db.prepare('SELECT incarnation_id,execution_epoch,owner_epoch,deleted,state FROM sessions WHERE id=?').get(lease.owner_session_id);
         return owner!==undefined&&owner.deleted===0&&owner.owner_epoch===this.store.epoch&&owner.incarnation_id===lease.owner_incarnation_id&&owner.execution_epoch===lease.execution_epoch&&['running','starting'].includes(String(owner.state));
     }
+    private namespaceAdmission(identity:RuntimeIdentity,workspace:string,path:string,ignoreMutation?:string):void {
+        if(!this.conservativeNamespace)return;
+        const parent=parentKey(path);
+        const unresolved=this.store.db.prepare(`SELECT n.session_id,n.mutation_id FROM writer_namespace_intents n JOIN file_mutations m ON m.workspace_id=n.workspace_id AND m.session_id=n.session_id AND m.mutation_id=n.mutation_id WHERE n.workspace_id=? AND n.parent_key=? AND m.state IN ('prepared','applied','needs_recovery')`).all(workspace,parent);
+        if(unresolved.some(row=>row.session_id!==identity.session_id||row.mutation_id!==ignoreMutation))fail('RESOURCE_RECOVERING','An unresolved mutation freezes this absent-name namespace.',{parent});
+        const leases=this.store.db.prepare('SELECT l.* FROM writer_namespace_claims n JOIN writer_leases l ON l.lease_id=n.lease_id WHERE l.workspace_id=? AND n.parent_key=? AND l.active=1').all(workspace,parent).map(row=>leaseRow(row)!);
+        for(const lease of leases)if(this.active(lease)&&!(lease.owner_session_id===identity.session_id&&lease.owner_incarnation_id===identity.incarnation_id&&lease.execution_epoch===identity.execution_epoch))fail('FILE_BUSY','Another session reserves missing names in this parent directory.',{parent,owner_session_id:lease.owner_session_id});
+    }
+    private rememberNamespaceClaim(leaseId:string,path:string):void {
+        if(this.conservativeNamespace)this.store.db.prepare('INSERT OR REPLACE INTO writer_namespace_claims(lease_id,parent_key) VALUES(?,?)').run(leaseId,parentKey(path));
+    }
+    private rememberNamespaceIntent(row:MutationRow):void {
+        if(this.conservativeNamespace)for(const path of this.mutationPaths(row))this.store.db.prepare('INSERT OR IGNORE INTO writer_namespace_intents VALUES(?,?,?,?)').run(row.workspace_id,parentKey(path),row.session_id,row.mutation_id);
+    }
+    private rememberMutationInput(row:MutationRow,input:FileChange):void {
+        this.store.db.prepare('INSERT INTO writer_mutation_inputs VALUES(?,?,?,?,?)').run(row.workspace_id,row.session_id,row.mutation_id,input.path,input.target_path??null);
+    }
+    private retirePresentNamespaceClaims(row:MutationRow,present:string[]):void {
+        if(!this.conservativeNamespace)return;
+        for(const path of present)this.store.db.prepare('DELETE FROM writer_namespace_claims WHERE lease_id IN (SELECT lease_id FROM writer_leases WHERE workspace_id=? AND resource_key=? AND owner_session_id=? AND owner_incarnation_id=? AND coordinator_epoch=?)').run(row.workspace_id,path,row.session_id,row.incarnation_id,row.coordinator_epoch);
+    }
     private claimView(lease: LeaseRow): Claim {
         return { path: lease.resource_key, lease_id: lease.lease_id, coordinator_epoch: lease.coordinator_epoch, fencing_token: lease.fencing_token, expires_at: new Date(lease.expires_at).toISOString() };
     }
@@ -469,30 +511,40 @@ export class Writer {
         purpose: string;
         request_id: string;
         ttl_ms?: number;
-    }): {
-        claims: Claim[];
-    } {
+    }): ClaimResult {
+        requireWriterIdentityScheme(this.store);
         noExtra(record(input), ['paths', 'purpose', 'request_id', 'ttl_ms']);
         const { session, workspace } = this.context(identity);
         string(input.request_id, 'request_id', 256);
         string(input.purpose, 'purpose', 4096);
         if (!Array.isArray(input.paths) || input.paths.length === 0 || input.paths.length > 100)
             fail('INVALID_ARGUMENT', 'paths must contain 1–100 files.');
-        const paths = [...new Set(input.paths.map(p => this.key(workspace.root, p)))].sort(), ttl = integer(input.ttl_ms ?? this.ttl, 'ttl_ms', 1, 3600000), fp = fingerprint({ action: 'claim', paths, purpose: input.purpose, ttl: input.ttl_ms ?? null });
+        for(const path of input.paths)validateManagedPathInput(path);
+        const inputPaths=canonical([...new Set(input.paths)].sort()),priorInput=this.store.db.prepare('SELECT paths FROM writer_claim_inputs WHERE session_id=? AND request_id=?').get(session.id,input.request_id),priorRequest=this.store.db.prepare('SELECT result FROM writer_requests WHERE session_id=? AND request_id=?').get(session.id,input.request_id);
+        const priorResult=priorRequest?record(JSON.parse(String(priorRequest.result))):undefined,priorClaims=priorResult?.claims,priorMappings=priorResult?.path_mappings;
+        const cachedPaths=Array.isArray(priorClaims)?priorClaims.map(value=>string(record(value).path,'cached claim path',4096)).sort():undefined;
+        if(priorMappings!==undefined){
+            if(!Array.isArray(priorMappings))fail('STORAGE_ERROR','Persisted claim mappings are invalid.');
+            const priorRawPaths=priorMappings.map(value=>string(record(value).requested_path,'persisted requested path',Number.MAX_SAFE_INTEGER));
+            if(canonical([...new Set(priorRawPaths)].sort())!==inputPaths)fail('IDEMPOTENCY_CONFLICT','Mapped claim request ID belongs to a different raw path set; alias spelling changes require a new claim request.');
+        }
+        const unchangedInput=priorMappings!==undefined||priorInput?.paths===inputPaths||(!priorInput&&cachedPaths!==undefined&&canonical([...new Set(input.paths.map(path=>normalizeManagedPath(workspace.root,path)))].sort())===canonical(cachedPaths));
+        const resolutions=unchangedInput&&cachedPaths?undefined:[...new Set(input.paths)].sort().map(requested_path=>({requested_path,path:this.key(workspace.root,requested_path)}));
+        const paths = resolutions?[...new Set(resolutions.map(value=>value.path))].sort():cachedPaths!, ttl = integer(input.ttl_ms ?? this.ttl, 'ttl_ms', 1, 3600000), fp = fingerprint({ action: 'claim', paths, purpose: input.purpose, ttl: input.ttl_ms ?? null });
         return this.lock(workspace.id, paths, () => this.store.transaction(() => {
             this.store.assertIdentity(identity);
-            const cached = this.cachedRequest<{
-                claims: Claim[];
-            }>(session.id, input.request_id, fp);
+            const cached = this.cachedRequest<ClaimResult>(session.id, input.request_id, fp);
             if (cached)
                 return { claims: cached.claims.map(c => {
                         const lease = this.store.db.prepare('SELECT * FROM writer_leases WHERE lease_id=?').get(c.lease_id) as LeaseRow | undefined;
                         return { ...c, active: lease !== undefined && this.active(lease) && lease.owner_incarnation_id === identity.incarnation_id && lease.execution_epoch === identity.execution_epoch };
-                    }) };
+                    }),...(cached.path_mappings!==undefined?{path_mappings:cached.path_mappings}:{}) };
+            if(resolutions===undefined)fail('STORAGE_ERROR','Original claim disappeared before its cached result could be returned; no mapping was guessed.');
             if(!['running','starting'].includes(this.store.assertIdentity(identity).state))fail('LEASE_EXPIRED','Stopped or waiting work cannot begin a new file claim.');
+            const missing=new Set<string>();
             for (const path of paths) {
                 this.guard(workspace.id, path);
-                this.withPath(workspace.root, path, a => a.snapshot(this.maximum));
+                if(this.withPath(workspace.root, path, a => {if(a.key!==path)fail('PATH_NOT_ALLOWED','Canonical entry spelling changed during lease acquisition.');return a.snapshot(this.maximum);})===null){missing.add(path);this.namespaceAdmission(identity,workspace.id,path);}
                 const leases = this.store.db.prepare('SELECT * FROM writer_leases WHERE workspace_id=? AND resource_key=? AND active=1').all(workspace.id, path).map(row => leaseRow(row)!);
                 for (const lease of leases) {
                     if (this.active(lease) && !(lease.owner_session_id === session.id && lease.owner_incarnation_id === identity.incarnation_id && lease.execution_epoch === identity.execution_epoch))
@@ -501,17 +553,21 @@ export class Writer {
             }
             const claims = paths.map(path => {
                 const own = this.store.db.prepare('SELECT * FROM writer_leases WHERE workspace_id=? AND resource_key=? AND active=1 AND owner_session_id=? AND owner_incarnation_id=? AND execution_epoch=? AND coordinator_epoch=? AND expires_mono>?').get(workspace.id, path, session.id, identity.incarnation_id, identity.execution_epoch, this.store.epoch, this.store.clock.monotonic()) as LeaseRow | undefined;
-                if (own)
+                if (own){
+                    if(missing.has(path))this.rememberNamespaceClaim(own.lease_id,path);
                     return this.claimView(own);
+                }
                 this.store.db.prepare('UPDATE writer_leases SET active=0 WHERE workspace_id=? AND resource_key=?').run(workspace.id, path);
                 this.store.db.prepare('UPDATE resource_guards SET last_fencing_token=last_fencing_token+1 WHERE workspace_id=? AND resource_key=?').run(workspace.id, path);
                 const token = Number(this.store.db.prepare('SELECT last_fencing_token FROM resource_guards WHERE workspace_id=? AND resource_key=?').get(workspace.id, path)!.last_fencing_token);
                 const lease: LeaseRow = { lease_id: randomUUID(), workspace_id: workspace.id, resource_key: path, owner_session_id: session.id, owner_incarnation_id: identity.incarnation_id, execution_epoch: identity.execution_epoch, coordinator_epoch: this.store.epoch, fencing_token: token, expires_mono: this.store.clock.monotonic() + ttl, expires_at: this.store.clock.utc() + ttl, active: 1 };
                 this.store.db.prepare('INSERT INTO writer_leases VALUES(?,?,?,?,?,?,?,?,?,?,?)').run(lease.lease_id, workspace.id, path, session.id, identity.incarnation_id, identity.execution_epoch, this.store.epoch, token, lease.expires_mono, lease.expires_at, 1);
+                if(missing.has(path))this.rememberNamespaceClaim(lease.lease_id,path);
                 return this.claimView(lease);
             });
-            const result = { claims };
+            const result:ClaimResult = { claims,path_mappings:resolutions.map(value=>({...value,lease_id:claims.find(claim=>claim.path===value.path)!.lease_id})) };
             this.remember(session.id, input.request_id, fp, result);
+            this.store.db.prepare('INSERT INTO writer_claim_inputs VALUES(?,?,?)').run(session.id,input.request_id,inputPaths);
             this.store.emitEvent({ project_id: session.project_id, workspace_id: workspace.id, actor_session_id: session.id, type: 'files.claimed', payload: result });
             return result;
         }));
@@ -590,6 +646,7 @@ export class Writer {
                 if (!l || l.owner_session_id !== session.id || l.owner_incarnation_id !== identity.incarnation_id || l.execution_epoch !== identity.execution_epoch || !this.active(l))
                     fail('STALE_FENCING_TOKEN', 'Cannot renew an expired or superseded lease.');
                 this.guard(workspace.id, l.resource_key);
+                if(this.store.db.prepare('SELECT 1 FROM writer_namespace_claims WHERE lease_id=?').get(l.lease_id)!==undefined)this.namespaceAdmission(identity,workspace.id,l.resource_key);
                 return l;
             });
             const claims = leases.map(l => {
@@ -740,14 +797,16 @@ export class Writer {
         if(input.operation==='rename'){
             string(input.target_path,'target_path',4096);string(input.target_lease_id,'target_lease_id',256);integer(input.target_fencing_token,'target_fencing_token',1,Number.MAX_SAFE_INTEGER);
             if(!Object.hasOwn(value,'expected_target_version')||input.expected_target_version===undefined)fail('INVALID_ARGUMENT','Rename requires explicit expected_target_version: null.');
-            if(input.expected_target_version!==null)fail('UNSUPPORTED_ATOMIC_OPERATION','Destination overwrite is not supported: rename uses an atomic no-replace primitive, not check-then-overwrite.');
+            if(input.expected_target_version!==null)fail('UNSUPPORTED_ATOMIC_OPERATION','Destination overwrite is not supported; participating dsh writers require an absent target while both resources are owned.');
         }else if(['target_path','expected_target_version','target_lease_id','target_fencing_token'].some(key=>Object.hasOwn(value,key)))fail('INVALID_ARGUMENT','Destination fields are valid only for rename.');
     }
     applyFileChange(identity: RuntimeIdentity, input: FileChange): MutationResult {
         this.validateChange(input);
         const { session, workspace } = this.context(identity);
-        const requestKey = resourceKey(workspace.root, input.path), targetKey=input.operation==='rename'?resourceKey(workspace.root,input.target_path!):undefined;
-        const request={ path: requestKey, operation: input.operation, expected_version: input.expected_version, content: input.content, patch: input.patch,...targetKey?{target_path:targetKey,expected_target_version:null}:{} },requestFingerprint = fingerprint(request), prior = this.mutation(workspace.id, session.id, input.mutation_id);
+        const prior=this.mutation(workspace.id,session.id,input.mutation_id),priorInput=prior?this.store.db.prepare('SELECT path,target_path FROM writer_mutation_inputs WHERE workspace_id=? AND session_id=? AND mutation_id=?').get(workspace.id,session.id,input.mutation_id):undefined,priorRequest=prior?record(JSON.parse(prior.request)):undefined;
+        const knownInput=prior!==undefined&&((priorInput?.path===input.path&&priorInput.target_path===(input.target_path??null))||(!priorInput&&normalizeManagedPath(workspace.root,input.path)===prior.resource_key&&(input.operation!=='rename'||normalizeManagedPath(workspace.root,input.target_path!)===priorRequest?.target_path)));
+        const requestKey = knownInput?prior!.resource_key:resourceKey(workspace.root, input.path), targetKey=input.operation==='rename'?(knownInput?String(priorRequest!.target_path):resourceKey(workspace.root,input.target_path!)):undefined;
+        const request={ path: requestKey, operation: input.operation, expected_version: input.expected_version, content: input.content, patch: input.patch,...targetKey?{target_path:targetKey,expected_target_version:null}:{} },requestFingerprint = fingerprint(request);
         if (prior) {
             if (prior.request_fingerprint !== requestFingerprint)
                 fail('IDEMPOTENCY_CONFLICT', 'Mutation ID already belongs to different content.');
@@ -757,6 +816,7 @@ export class Writer {
                 fail('OPERATION_ABORTED', 'The original operation was aborted; it cannot be executed again.', { original_reason: prior.error });
             fail('OUTCOME_UNKNOWN', 'Original mutation is unresolved; reconcile it without executing another write.', { state: prior.state, mutation_id: input.mutation_id });
         }
+        requireWriterIdentityScheme(this.store);
         if(targetKey!==undefined)return this.applyRename(identity,input,session,workspace,requestKey,targetKey,request,requestFingerprint);
         return this.withPath(workspace.root, input.path, anchor => this.lock(workspace.id, [anchor.key], () => {
             this.store.assertIdentity(identity);
@@ -795,7 +855,12 @@ export class Writer {
             const evidence: Evidence = { old: old?.info ?? null, old_version: old?.version ?? null, new_version: next, staged: null, artifact: '.dsh-collab-' + randomUUID(), directory: null, published: false, no_op: noOp };
             const row: MutationRow = { mutation_id: input.mutation_id, workspace_id: workspace.id, session_id: session.id, incarnation_id: identity.incarnation_id, coordinator_epoch: this.store.epoch, request_fingerprint: fp, operation: input.operation, resource_key: anchor.key, request: canonical({ path: anchor.key, operation: input.operation, expected_version: input.expected_version, content: input.content, patch: input.patch }), state: 'prepared', evidence: canonical(evidence), original_result: null, error: null, created_at: this.store.clock.utc() };
             this.store.transaction(() => {
+                if(input.operation==='create'||input.operation==='delete'){
+                    this.namespaceAdmission(identity,workspace.id,anchor.key);
+                    this.rememberNamespaceClaim(input.lease_id,anchor.key);
+                }
                 this.store.db.prepare('INSERT INTO file_mutations VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(row.mutation_id, row.workspace_id, row.session_id, row.incarnation_id, row.coordinator_epoch, row.request_fingerprint, row.operation, row.resource_key, row.request, row.state, row.evidence, null, null, row.created_at);
+                this.rememberNamespaceIntent(row);this.rememberMutationInput(row,input);
                 this.store.db.prepare("UPDATE resource_guards SET recovery_state='recovering' WHERE workspace_id=? AND resource_key=?").run(workspace.id, anchor.key);
             });
             let actionStarted = false;
@@ -808,9 +873,9 @@ export class Writer {
                 evidence.directory = artifact.identity;
                 this.store.db.prepare('UPDATE file_mutations SET evidence=? WHERE workspace_id=? AND session_id=? AND mutation_id=?').run(canonical(evidence), workspace.id, session.id, input.mutation_id);
                 if (bytes !== null) {
-                    const fd = openSync(`${artifact.path}/new`, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, old?.info.mode ?? 0o600);
+                    const fd = openSync(`${artifact.path}/new`, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, old?.info.mode ?? 0o600);
                     try {
-                        fchmodSync(fd, old?.info.mode ?? 0o600);
+                        preservePermissions(fd, old?.info.mode ?? 0o600);
                         let at = 0;
                         while (at < bytes.length)
                             at += writeSync(fd, bytes, at, bytes.length - at);
@@ -831,6 +896,7 @@ export class Writer {
                 if ((beforePublish?.version ?? null) !== evidence.old_version || ((beforePublish !== null || evidence.old !== null) && !sameInode(beforePublish?.info ?? null, evidence.old)))
                     fail('VERSION_CONFLICT', 'Target changed before atomic publication; no write performed.', { origin: 'external/unknown' });
                 this.fault?.('before_publish');
+                if(input.operation==='create'||input.operation==='delete')this.namespaceAdmission(identity,workspace.id,anchor.key,row.mutation_id);
                 anchor.revalidate();
                 artifact.revalidate();
                 const finalBase = anchor.snapshot(this.maximum);
@@ -898,12 +964,15 @@ export class Writer {
             if(source.parentInfo.dev!==target.parentInfo.dev)fail('UNSUPPORTED_ATOMIC_OPERATION','Cross-filesystem rename is not supported; no copy/delete fallback exists.');
             this.readReceipt(identity,workspace.id,sourceKey,input);
             // Flush the exact existing inode before promising a durable move.
-            const fd=openSync(source.target,INFO_FLAGS);
+            const fd=openSync(source.target,renameSourceFlushFlags());
             try{if(!stable(info(fstatSync(fd,{bigint:true})),old.info))fail('VERSION_CONFLICT','Rename source changed before its durability barrier.');fsyncSync(fd);}finally{closeSync(fd);}
             const evidence:Evidence={old:old.info,old_version:old.version,new_version:null,staged:null,artifact:'.dsh-collab-'+randomUUID(),directory:null,published:false,no_op:false,rename:{target:targetKey,source_parent:source.parentInfo,target_parent:target.parentInfo}};
             const row:MutationRow={mutation_id:input.mutation_id,workspace_id:workspace.id,session_id:session.id,incarnation_id:identity.incarnation_id,coordinator_epoch:this.store.epoch,request_fingerprint:fp,operation:'rename',resource_key:sourceKey,request:canonical(request),state:'prepared',evidence:canonical(evidence),original_result:null,error:null,created_at:this.store.clock.utc()};
             this.store.transaction(()=>{
+                this.namespaceAdmission(identity,workspace.id,sourceKey);this.namespaceAdmission(identity,workspace.id,targetKey);
+                this.rememberNamespaceClaim(input.lease_id,sourceKey);this.rememberNamespaceClaim(input.target_lease_id!,targetKey);
                 this.store.db.prepare('INSERT INTO file_mutations VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(row.mutation_id,row.workspace_id,row.session_id,row.incarnation_id,row.coordinator_epoch,row.request_fingerprint,row.operation,row.resource_key,row.request,row.state,row.evidence,null,null,row.created_at);
+                this.rememberNamespaceIntent(row);this.rememberMutationInput(row,input);
                 for(const path of [sourceKey,targetKey])this.store.db.prepare("UPDATE resource_guards SET recovery_state='recovering' WHERE workspace_id=? AND resource_key=?").run(workspace.id,path);
             });
             let actionStarted=false;
@@ -914,16 +983,26 @@ export class Writer {
                 if(!current||current.version!==old.version||!stable(current.info,old.info))fail('VERSION_CONFLICT','Rename source changed before publication.',{origin:'external/unknown'});
                 if(target.snapshot(this.maximum)!==null)fail('VERSION_CONFLICT','Rename destination was created before publication.',{origin:'external/unknown'});
                 this.fault?.('before_publish');
+                this.namespaceAdmission(identity,workspace.id,sourceKey,row.mutation_id);this.namespaceAdmission(identity,workspace.id,targetKey,row.mutation_id);
                 source.revalidate();target.revalidate();
                 const finalSource=source.snapshot(this.maximum);
                 if(!finalSource||finalSource.version!==old.version||!stable(finalSource.info,old.info))fail('VERSION_CONFLICT','Rename source changed at publication.',{origin:'external/unknown'});
                 actionStarted=true;
-                try{renameNoReplace(source.parentFd,source.leaf,target.parentFd,target.leaf);}catch(error){
+                try{renameNoReplace(source.parent,source.leaf,target.parent,target.leaf);}catch(error){
                     const code=fsCode(error);
-                    if(error instanceof CoordinationError||['EEXIST','EXDEV','EINVAL','ENOSYS','EOPNOTSUPP','EROFS','EACCES','EPERM','ENOENT','ENOTDIR'].includes(code??'')){
-                        actionStarted=false;
-                        if(code==='EEXIST')fail('VERSION_CONFLICT','Rename destination was created at atomic publication; its data was not overwritten.',{path:targetKey,origin:'external/unknown'});
-                        if(['EXDEV','EINVAL','ENOSYS','EOPNOTSUPP'].includes(code??''))fail('UNSUPPORTED_ATOMIC_OPERATION','The filesystem cannot perform this atomic no-replace rename; no fallback was attempted.',{cause:code});
+                    // A Node error code alone does not prove no filesystem action
+                    // happened. Only our own precheck or unchanged source+target
+                    // evidence permits a terminal abort; otherwise retain intent.
+                    if(error!==null&&typeof error==='object'&&'beforePublication' in error&&error.beforePublication===true)actionStarted=false;
+                    else{
+                        try{
+                            const unchangedSource=source.snapshot(this.maximum),unchangedTarget=target.snapshot(this.maximum);
+                            if(unchangedSource!==null&&unchangedSource.version===old.version&&stable(unchangedSource.info,old.info)&&unchangedTarget===null)actionStarted=false;
+                        }catch{/* Preserve unknown outcome when the post-error namespace cannot be read. */}
+                    }
+                    if(!actionStarted){
+                        if(code==='EEXIST')fail('VERSION_CONFLICT','Rename destination exists at publication precheck; its data was not overwritten.',{path:targetKey,origin:'external/unknown'});
+                        if(['EXDEV','EINVAL','ENOSYS','EOPNOTSUPP'].includes(code??''))fail('UNSUPPORTED_ATOMIC_OPERATION','The filesystem cannot perform this managed rename; no copy/delete fallback was attempted.',{cause:code});
                     }
                     throw error;
                 }
@@ -954,6 +1033,7 @@ export class Writer {
             const event = this.store.emitEvent({ id: 'mutation:' + fingerprint([row.workspace_id, row.session_id, row.mutation_id]), project_id: session.project_id, workspace_id: row.workspace_id, actor_session_id: row.session_id, type: evidence.no_op ? 'file.noop' : 'file.changed', payload: { mutation_id: row.mutation_id, path: row.resource_key, previous_version: evidence.old_version, new_version: evidence.new_version, operation: row.operation, no_op: evidence.no_op,...evidence.rename?{destination_path:evidence.rename.target,destination_version:evidence.old_version}:{} } });
             const result: MutationResult = { mutation_id: row.mutation_id, previous_version: evidence.old_version, new_version: evidence.new_version, event_cursor: String(event.sequence), no_op: evidence.no_op,...evidence.rename?{destination_path:evidence.rename.target,destination_version:evidence.old_version!}:{} };
             this.store.db.prepare("UPDATE file_mutations SET state='committed',evidence=?,original_result=?,error=NULL WHERE workspace_id=? AND session_id=? AND mutation_id=?").run(canonical(evidence), canonical(result), row.workspace_id, row.session_id, row.mutation_id);
+            this.retirePresentNamespaceClaims(row,row.operation==='rename'?[evidence.rename!.target]:row.operation==='delete'?[]:[row.resource_key]);
             for(const path of this.mutationPaths(row))this.store.db.prepare("UPDATE resource_guards SET recovery_state='ready' WHERE workspace_id=? AND resource_key=?").run(row.workspace_id,path);
             return result;
         });
@@ -964,6 +1044,7 @@ export class Writer {
     private abort(row: MutationRow, reason: string): void {
         this.store.transaction(() => {
             this.store.db.prepare("UPDATE file_mutations SET state='aborted',error=? WHERE workspace_id=? AND session_id=? AND mutation_id=?").run(reason, row.workspace_id, row.session_id, row.mutation_id);
+            this.retirePresentNamespaceClaims(row,row.operation==='create'?[]:[row.resource_key]);
             for(const path of this.mutationPaths(row))this.store.db.prepare("UPDATE resource_guards SET recovery_state='ready' WHERE workspace_id=? AND resource_key=?").run(row.workspace_id,path);
             const session = this.store.session(row.session_id);
             this.store.emitEvent({ id: 'mutation:' + fingerprint([row.workspace_id, row.session_id, row.mutation_id]), project_id: session.project_id, workspace_id: row.workspace_id, actor_session_id: row.session_id, type: 'file.aborted', payload: { mutation_id: row.mutation_id, path: row.resource_key, reason } });
@@ -1017,6 +1098,7 @@ export class Writer {
         const { session, workspace } = this.context(identity);
         string(input.mutation_id, 'mutation_id', 256);
         const row = this.mutation(workspace.id, session.id, input.mutation_id);
+        if(row)requireWriterIdentityScheme(this.store);
         if (!row || row.state === 'committed' || row.state === 'aborted'){
             if(row)this.cleanupTerminal(row);
             return this.status(row);
@@ -1031,6 +1113,10 @@ export class Writer {
         try{const workspace=this.store.workspace(row.workspace_id),evidence=evidenceOf(row);this.withPath(workspace.root,row.resource_key,anchor=>this.lock(workspace.id,[row.resource_key],()=>this.cleanup(anchor,evidence)));}catch{/* Preserve unowned/corrupt evidence or unavailable parents for operator review. */}
     }
     recoverAll(): void {
+        // Recovery and terminal artifact cleanup are filesystem writes too.
+        // A new read-only coordinator is allowed; an old journal is not silently
+        // migrated through an unvalidated Windows namespace policy.
+        if(this.store.db.prepare('SELECT 1 FROM file_mutations LIMIT 1').get()!==undefined)requireWriterIdentityScheme(this.store);
         for(const raw of this.store.db.prepare("SELECT * FROM file_mutations WHERE state IN ('committed','aborted') ORDER BY created_at,mutation_id").all()){
             try{this.cleanupTerminal(mutationRow(raw)!);}catch{/* Invalid terminal rows are not grounds to replay or erase evidence. */}
         }

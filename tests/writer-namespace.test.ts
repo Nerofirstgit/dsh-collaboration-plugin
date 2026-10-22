@@ -1,0 +1,47 @@
+/** Conservative absent-name policy on real Linux files, not a native Windows certification. */
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,rmSync} from 'node:fs'
+import {tmpdir} from 'node:os'
+import {join} from 'node:path'
+import {Store} from '../src/store.ts'
+import {Writer,type Claim,type FileChange} from '../src/writer.ts'
+import {digest} from '../src/util.ts'
+import type {RuntimeIdentity} from '../src/types.ts'
+
+function fixture(){
+ const dir=mkdtempSync(join(tmpdir(),'dsh-namespace-')),root=join(dir,'workspace');mkdirSync(root);mkdirSync(join(root,'other'))
+ let time=1_000
+ const store=new Store(join(dir,'private','store.sqlite'),{utc:()=>time,monotonic:()=>time})
+ store.db.prepare('INSERT INTO workspaces(id,project_id,root) VALUES(?,?,?)').run('w','p',root)
+ function identity(id:string):RuntimeIdentity{const token='token-'+id;store.db.prepare('INSERT INTO sessions(id,project_id,workspace_id,incarnation_id,execution_epoch,token_hash,title,task_summary,state,host_id,started_at,last_heartbeat_at,last_heartbeat_mono,owner_epoch) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(id,'p','w','inc-'+id,1,digest(token),id,'','running','test',time,time,time,store.epoch);return{session_id:id,incarnation_id:'inc-'+id,execution_epoch:1,runtime_token:token,coordinator_epoch:store.epoch,coordinator_domain:store.domain}}
+ const a=identity('a'),b=identity('b'),writer=new Writer(store,{lease_ttl_ms:100},{conservativeNamespace:true})
+ let request=0
+ function claim(who:RuntimeIdentity,path:string,id='claim-'+(++request)){return writer.claimFiles(who,{paths:[path],purpose:'namespace',request_id:id}).claims[0]!}
+ function change(who:RuntimeIdentity,lease:Claim,path:string,operation:FileChange['operation'],id:string,content?:string,target?:Claim){const read=operation==='create'?undefined:writer.readFile(who,{path});return writer.applyFileChange(who,{path,operation,expected_version:read?.version??null,read_token:read?.read_token,lease_id:lease.lease_id,fencing_token:lease.fencing_token,coordinator_epoch:lease.coordinator_epoch,mutation_id:id,content,...target?{target_path:target.path,target_lease_id:target.lease_id,target_fencing_token:target.fencing_token,expected_target_version:null}:{}})}
+ return{dir,root,store,a,b,writer,claim,change,advance(ms:number){time+=ms},close(){store.close();rmSync(dir,{recursive:true,force:true})}}
+}
+
+test('different owners cannot reserve distinct absent spellings in one canonical parent',()=>{const f=fixture();try{f.claim(f.a,'alpha.txt');assert.throws(()=>f.claim(f.b,'BETA.txt'),{code:'FILE_BUSY'});assert.equal(f.claim(f.a,'beta.txt').path,'beta.txt');assert.equal(f.claim(f.b,'other/independent.txt').path,'other/independent.txt')}finally{f.close()}})
+
+test('existing different files can coexist and progress beside an absent-name reservation',()=>{const f=fixture();try{writeFileSync(join(f.root,'one.txt'),'one');writeFileSync(join(f.root,'two.txt'),'two');f.claim(f.a,'pending.txt');const a=f.claim(f.a,'one.txt'),b=f.claim(f.b,'two.txt');f.change(f.a,a,a.path,'replace','one','ONE');f.change(f.b,b,b.path,'replace','two','TWO');assert.equal(readFileSync(join(f.root,'two.txt'),'utf8'),'TWO')}finally{f.close()}})
+
+test('namespace claims use live incarnation, monotonic expiry, renew and release authority',()=>{const f=fixture();try{const a=f.claim(f.a,'alpha.txt');f.writer.renewClaims(f.a,{lease_ids:[a.lease_id],request_id:'renew',ttl_ms:200});f.advance(101);assert.throws(()=>f.claim(f.b,'beta.txt'),{code:'FILE_BUSY'});f.advance(100);const b=f.claim(f.b,'beta.txt');assert.throws(()=>f.writer.renewClaims(f.a,{lease_ids:[a.lease_id],request_id:'stale-renew'}),{code:'STALE_FENCING_TOKEN'});f.writer.releaseFiles(f.a,{lease_ids:[a.lease_id],request_id:'release-old'});assert.throws(()=>f.claim(f.a,'gamma.txt'),{code:'FILE_BUSY'});f.writer.releaseFiles(f.b,{lease_ids:[b.lease_id],request_id:'release-b'});assert.equal(f.claim(f.a,'gamma.txt').path,'gamma.txt')}finally{f.close()}})
+
+test('cached claims never silently reacquire expired namespace ownership',()=>{const f=fixture();try{f.claim(f.a,'alpha.txt','same');f.advance(101);f.claim(f.b,'beta.txt');const before=Number(f.store.db.prepare('SELECT COUNT(*) n FROM writer_leases').get()!.n);assert.equal(f.writer.claimFiles(f.a,{paths:['alpha.txt'],purpose:'namespace',request_id:'same'}).claims[0]!.active,false);assert.equal(Number(f.store.db.prepare('SELECT COUNT(*) n FROM writer_leases').get()!.n),before);assert.throws(()=>f.claim(f.a,'gamma.txt'),{code:'FILE_BUSY'})}finally{f.close()}})
+
+test('finished create releases absent-name reservation without releasing its existing-file lease',()=>{const f=fixture();try{const a=f.claim(f.a,'alpha.txt');f.change(f.a,a,a.path,'create','create-a','A');assert.equal(f.claim(f.b,'beta.txt').path,'beta.txt');assert.throws(()=>f.change(f.a,a,a.path,'delete','delete-a'),{code:'FILE_BUSY'});assert.equal(readFileSync(join(f.root,'alpha.txt'),'utf8'),'A')}finally{f.close()}})
+
+test('a deletion retains its still-active missing-name claim until lease release',()=>{const f=fixture();try{writeFileSync(join(f.root,'existing.txt'),'old');const a=f.claim(f.a,'existing.txt');f.change(f.a,a,a.path,'delete','delete');assert.throws(()=>f.claim(f.b,'alias.txt'),{code:'FILE_BUSY'});f.writer.releaseFiles(f.a,{lease_ids:[a.lease_id],request_id:'release'});assert.equal(f.claim(f.b,'alias.txt').path,'alias.txt')}finally{f.close()}})
+
+test('durable unresolved publication freezes missing aliases after expiry and reopen of Writer',()=>{const f=fixture();try{const a=f.claim(f.a,'alpha.txt');f.writer.fault=point=>{if(point==='after_publish')throw new Error('response/crash window')};assert.throws(()=>f.change(f.a,a,a.path,'create','uncertain','A'),{code:'OUTCOME_UNKNOWN'});f.advance(101);assert.throws(()=>f.claim(f.b,'other-spelling.txt'),{code:'RESOURCE_RECOVERING'});const writer=new Writer(f.store,{}, {conservativeNamespace:true});assert.throws(()=>writer.claimFiles(f.b,{paths:['other-spelling.txt'],purpose:'namespace',request_id:'reopen'}),{code:'RESOURCE_RECOVERING'});writer.reconcile(f.a,{mutation_id:'uncertain'});assert.equal(writer.claimFiles(f.b,{paths:['other-spelling.txt'],purpose:'namespace',request_id:'recovered'}).claims[0]!.path,'other-spelling.txt')}finally{f.close()}})
+
+test('an unresolved rename freezes both parent namespaces, not just exact leaf keys',()=>{const f=fixture();try{writeFileSync(join(f.root,'source.txt'),'S');const source=f.claim(f.a,'source.txt'),target=f.claim(f.a,'other/target.txt');f.writer.fault=point=>{if(point==='after_publish_evidence')throw new Error('crash window')};assert.throws(()=>f.change(f.a,source,source.path,'rename','rename',undefined,target),{code:'OUTCOME_UNKNOWN'});f.advance(101);assert.throws(()=>f.claim(f.b,'new-root.txt'),{code:'RESOURCE_RECOVERING'});assert.throws(()=>f.claim(f.b,'other/new-destination.txt'),{code:'RESOURCE_RECOVERING'});f.writer.fault=undefined;f.writer.reconcile(f.a,{mutation_id:'rename'});assert.equal(f.claim(f.b,'other/new-destination.txt').path,'other/new-destination.txt')}finally{f.close()}})
+
+test('cached claim and mutation results survive removed parent without new filesystem side effects',()=>{const f=fixture();try{const a=f.claim(f.a,'other/alpha.txt','same');const result=f.change(f.a,a,a.path,'create','create','A');rmSync(join(f.root,'other'),{recursive:true});assert.equal(f.claim(f.a,'other/alpha.txt','same').lease_id,a.lease_id);assert.deepEqual(f.change(f.a,a,a.path,'create','create','A'),result);assert.throws(()=>f.change(f.a,a,a.path,'create','create','changed'),{code:'IDEMPOTENCY_CONFLICT'})}finally{f.close()}})
+
+test('prepared namespace fence outlives lease expiry while the original admitted create finishes',()=>{const f=fixture();try{const a=f.claim(f.a,'alpha.txt');f.writer.fault=point=>{if(point==='after_prepared'){f.advance(101);assert.throws(()=>f.claim(f.b,'different-spelling.txt'),{code:'RESOURCE_RECOVERING'})}};f.change(f.a,a,a.path,'create','original','A');assert.equal(readFileSync(join(f.root,'alpha.txt'),'utf8'),'A');assert.equal(f.claim(f.b,'different-spelling.txt').path,'different-spelling.txt')}finally{f.close()}})
+
+test('superseding an incarnation invalidates its namespace claim without waiting for TTL',()=>{const f=fixture();try{f.claim(f.a,'alpha.txt');f.store.db.prepare("UPDATE sessions SET incarnation_id='new-a',execution_epoch=2 WHERE id='a'").run();assert.equal(f.claim(f.b,'beta.txt').path,'beta.txt');assert.throws(()=>f.writer.releaseSession(f.a),{code:'STALE_INSTANCE'});const newA={...f.a,incarnation_id:'new-a',execution_epoch:2};assert.throws(()=>f.claim(newA,'gamma.txt'),{code:'FILE_BUSY'})}finally{f.close()}})
+
+test('conflicting multi-file namespace claim rolls back every new lease and request record',()=>{const f=fixture();try{f.claim(f.a,'alpha.txt');assert.throws(()=>f.writer.claimFiles(f.b,{paths:['other/independent.txt','new.txt'],purpose:'namespace',request_id:'all-or-none'}),{code:'FILE_BUSY'});assert.equal(f.store.db.prepare("SELECT COUNT(*) n FROM writer_leases WHERE owner_session_id='b'").get()!.n,0);assert.equal(f.store.db.prepare("SELECT COUNT(*) n FROM writer_requests WHERE request_id='all-or-none'").get()!.n,0);assert.equal(f.store.db.prepare("SELECT COUNT(*) n FROM writer_claim_inputs WHERE request_id='all-or-none'").get()!.n,0);assert.equal(f.claim(f.a,'other/independent.txt').path,'other/independent.txt')}finally{f.close()}})

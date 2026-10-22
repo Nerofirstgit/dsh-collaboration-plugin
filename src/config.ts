@@ -1,11 +1,11 @@
-import { homedir } from 'node:os'
+import { homedir, userInfo } from 'node:os'
 import { join, resolve } from 'node:path'
 import { fail } from './errors.ts'
 import type { Config } from './types.ts'
-/** Fixed local election namespace; never derive it from caller-controlled env. */
+export { coordinatorEndpoint } from './platform/ipc.ts'
+/** Fixed OS-account namespace, independent of HOME/DSH_HOME/TMPDIR overrides. */
 export function machineInstanceDirectory():string {
-  if(process.platform!=='linux'||!process.getuid)fail('UNSUPPORTED_PLATFORM','A Linux local OS-user instance namespace is required.')
-  return `/tmp/dsh-collaboration-instance-${process.getuid()}`
+  return join(userInfo().homedir,'.dsh-collaboration-instance')
 }
 /** Deployment settings are validated once at the trusted plugin configuration boundary. */
 export function resolveConfig(value: Partial<Config> = {}): Config {

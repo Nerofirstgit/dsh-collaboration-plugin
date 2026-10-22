@@ -20,6 +20,18 @@
     "./filesystem": {
       "types": "./lib/host/filesystem.d.ts",
       "default": "./lib/host/filesystem.js"
+    },
+    "./gui-config-editor": {
+      "types": "./lib/host/gui-config-editor.d.ts",
+      "default": "./lib/host/gui-config-editor.js"
+    },
+    "./gui-profile": {
+      "types": "./lib/host/gui-profile.d.ts",
+      "default": "./lib/host/gui-profile.js"
+    },
+    "./gui-controller-guard": {
+      "types": "./lib/host/gui-session-controller.d.ts",
+      "default": "./lib/host/gui-session-controller.js"
     }
   },
   "files": [
@@ -34,12 +46,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node --import tsx/esm --test tests/*.test.ts tests/host/*.test.ts",
     "test:integration": "node --import tsx/esm --test tests/integration/*.test.ts",
-    "test:components": "node --import tsx/esm --test tests/client.test.ts tests/bootstrap.test.ts tests/config.test.ts tests/store.test.ts tests/instance-lock.test.ts tests/identity.test.ts tests/host-store.test.ts tests/review-core-regressions.test.ts tests/review-recovery-fingerprint.test.ts tests/coordinator.test.ts tests/messaging.test.ts tests/writer.test.ts tests/writer-rename.test.ts tests/writer-storage-faults.test.ts tests/host/*.test.ts",
+    "test:components": "node --import tsx/esm --test tests/integration-fixture.test.ts tests/client.test.ts tests/client-readiness.test.ts tests/gui-configure.test.ts tests/bootstrap.test.ts tests/config.test.ts tests/store.test.ts tests/instance-lock.test.ts tests/portable-coordinator*.test.ts tests/portable-writer.test.ts tests/writer-namespace.test.ts tests/writer-claim-mapping.test.ts tests/portable-resource-paths.test.ts tests/portable-identity.test.ts tests/identity.test.ts tests/host-state.test.ts tests/host-store.test.ts tests/review-core-regressions.test.ts tests/review-recovery-fingerprint.test.ts tests/coordinator.test.ts tests/messaging.test.ts tests/writer.test.ts tests/writer-rename.test.ts tests/writer-storage-faults.test.ts tests/host/*.test.ts",
     "prepack": "npm run build"
-  },
-  "dependencies": {
-    "@deepseek-ai/node-addon-system": "0.1.2",
-    "koffi": "3.1.1"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "4.0.5",
@@ -57,7 +65,13 @@
     "@deepseek-ai/dsh-user-approval": "0.2.1-rc.2",
     "@deepseek-ai/schemastery": "3.18.5",
     "@deepseek-ai/cordis-plugin-loader": "1.0.6",
-    "@deepseek-ai/dsh-app-boot": "0.2.1-rc.2"
+    "@deepseek-ai/dsh-app-boot": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-config-editor": "0.2.1-rc.2",
+    "@deepseek-ai/cordis-plugin-include": "1.0.10",
+    "@deepseek-ai/dsh-agent-preset-registry": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-api-session-controller": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-typert-protocol": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-jobs-local": "0.2.1-rc.2"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
@@ -73,5 +87,11 @@
   "repository": {
     "type": "git",
     "url": "https://github.com/Nerofirstgit/dsh-collaboration-plugin.git"
+  },
+  "bin": {
+    "dsh-collaboration-gui-config": "lib/gui-configure.js"
+  },
+  "dependencies": {
+    "js-yaml": "4.3.2"
   }
 }

@@ -4,6 +4,8 @@ import { Identities } from './identity.ts'
 import { HostStore } from './host-store.ts'
 import { Messaging } from './messaging.ts'
 import { Writer } from './writer.ts'
+import {reserveHostStateRoots} from './host-state.ts'
+import {COOPERATION_PROTOCOL} from './protocol.ts'
 import type { Config, RuntimeIdentity, SessionState } from './types.ts'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import { CoordinationError, fail, success, failure } from './errors.ts'
@@ -12,7 +14,15 @@ import { record, string, integer } from './util.ts'
 export class Coordinator {
   readonly store:Store;readonly identities:Identities;readonly host:HostStore;readonly messaging:Messaging;readonly writer:Writer
   readonly config:Config
-  constructor(config:Config){this.config=config;this.store=new Store(join(config.data_dir,'coordinator.sqlite'));this.identities=new Identities(this.store,config);this.host=new HostStore(this.store,this.identities);this.messaging=new Messaging(this.store,config);this.messaging.recover();this.writer=new Writer(this.store,config);this.writer.recoverAll();this.host.onAdmit=(identity,revision,events)=>this.admit(identity,revision,events)}
+  constructor(config:Config){
+    this.config=config;this.store=new Store(join(config.data_dir,'coordinator.sqlite'))
+    try{
+      // Validate global state-root exclusions before any persisted writer recovery.
+      this.identities=new Identities(this.store,config);this.host=new HostStore(this.store,this.identities)
+      this.messaging=new Messaging(this.store,config);this.messaging.recover();this.writer=new Writer(this.store,config);this.writer.recoverAll()
+      this.host.onAdmit=(identity,revision,events)=>this.admit(identity,revision,events)
+    }catch(error){this.store.close();throw error}
+  }
   private admit(identity:RuntimeIdentity,revision:number,events:SessionEvent[]):void {
     const groups=new Map<string,{delivery_id:string;context_record_id:string;text:string}[]>()
     for(const event of events){if(event.type!=='user/message')continue;const data=event.data;const source=record(data.source);if(source.kind!=='session-coordination')continue;const batch=string(source.batch_id,'batch_id');const receipts=groups.get(batch)??[];const block=data.content[0];if(!block||block.type!=='text')fail('CONTEXT_CONFLICT','Collaboration message must contain exact text evidence.');receipts.push({delivery_id:string(source.delivery_id,'delivery_id'),context_record_id:String(data.id),text:block.text});groups.set(batch,receipts)}
@@ -22,7 +32,8 @@ export class Coordinator {
   private identity(value:RuntimeIdentity|undefined):RuntimeIdentity {if(!value)fail('STALE_INSTANCE','A private runtime identity is required.');this.store.assertIdentity(value);return value}
   async dispatch(connection:string,method:string,params:Record<string,unknown>,value?:RuntimeIdentity):Promise<unknown> {
     switch(method){
-      case 'ping':return{coordinator_epoch:this.store.epoch,coordinator_domain:this.store.domain,protected_mode:'host-enforcement-pending',pid:process.pid}
+      case 'reserve_host_state_roots':{if(value!==undefined)fail('PERMISSION_REQUIRED','Host-state reservation is trusted runtime setup, not an agent/session operation.');return reserveHostStateRoots(this.store,params)}
+      case 'ping':return{cooperation_protocol:COOPERATION_PROTOCOL,coordinator_epoch:this.store.epoch,coordinator_domain:this.store.domain,protected_mode:'host-enforcement-pending',pid:process.pid}
       case 'session_create':{const result=this.host.create(connection,params);this.configuredGrant(result.identity);return result}
       case 'session_open':{const result=this.host.open(connection,params);this.configuredGrant(result.identity);return result}
       case 'session_read':return this.host.read(connection,params,value)

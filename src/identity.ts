@@ -1,5 +1,5 @@
-import { realpathSync, statSync } from 'node:fs'
-import { basename, dirname, isAbsolute, relative, resolve, sep } from 'node:path'
+import { existsSync } from 'node:fs'
+import { basename, dirname, resolve, posix, win32 } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { hostname } from 'node:os'
 import { randomUUID } from 'node:crypto'
@@ -7,31 +7,52 @@ import { Store } from './store.ts'
 import { digest, fingerprint, secret } from './util.ts'
 import { fail } from './errors.ts'
 import { machineInstanceDirectory } from './config.ts'
+import {initializeHostStateReservations,assertWorkspaceOutsideHostState} from './host-state.ts'
+import {canonicalExistingDirectory,withinCanonical,type ResourcePathOptions} from './platform/resource-paths.ts'
 import type { Config, RuntimeIdentity, SessionRow, SessionState, SessionSummary } from './types.ts'
 export interface ProjectContext { project_id:string; workspace_id:string; root:string; common_dir:string|null }
+/** Internal pure fixture options; profile/RPC callers cannot supply filesystem or Git adapters. */
+export interface ProjectPathOptions extends ResourcePathOptions {git?:(directory:string,arg:string)=>string|null}
 /** Canonical local project identity; remote URL is intentionally irrelevant. */
-export function resolveProject(cwd:string, projectRoot?:string):ProjectContext {
-  const directory=realpathSync(cwd)
-  if(!statSync(directory).isDirectory())fail('PATH_NOT_ALLOWED','Session cwd is not a directory.')
-  const git=(arg:string):string|null=>{const result=spawnSync('git',['--no-optional-locks','-C',directory,'rev-parse',arg],{encoding:'utf8',timeout:5000,env:{...process.env,GIT_OPTIONAL_LOCKS:'0'}});return result.status===0?result.stdout.trim():null}
-  const top=git('--show-toplevel'), common=top?git('--git-common-dir'):null
-  const root=realpathSync(top??projectRoot??directory)
-  if(!within(root,directory))fail('PATH_NOT_ALLOWED','Working directory is outside the selected project root.')
-  const common_dir=common?realpathSync(isAbsolute(common)?common:resolve(directory,common)):null
+export function resolveProject(cwd:string, projectRoot?:string,options:ProjectPathOptions={}):ProjectContext {
+  const platform=options.platform??process.platform,api=platform==='win32'?win32:posix
+  const directory=canonicalExistingDirectory(cwd,options)
+  const git=(arg:string):string|null=>{
+    if(options.git)return options.git(directory,arg)
+    const result=spawnSync('git',['--no-optional-locks','-C',directory,'rev-parse',arg],{encoding:'utf8',timeout:5000,env:{...process.env,GIT_OPTIONAL_LOCKS:'0'}})
+    return result.status===0?result.stdout.trim():null
+  }
+  const top=git('--show-toplevel'),common=top?git('--git-common-dir'):null
+  const selectedRoot=projectRoot===undefined?undefined:canonicalExistingDirectory(projectRoot,options)
+  if(selectedRoot!==undefined&&!within(selectedRoot,directory,platform))fail('PATH_NOT_ALLOWED','Working directory is outside the explicit workspace root.')
+  const root=canonicalExistingDirectory(top??selectedRoot??directory,options)
+  if(selectedRoot!==undefined&&root!==selectedRoot)fail('PATH_NOT_ALLOWED','An explicit workspace root must match the resolved Git workspace; it cannot silently expand access.')
+  if(!within(root,directory,platform))fail('PATH_NOT_ALLOWED','Working directory is outside the selected project root.')
+  const common_dir=common?canonicalExistingDirectory(api.isAbsolute(common)?common:api.resolve(directory,common),options):null
   return {project_id:'project_'+digest(common_dir??root),workspace_id:'workspace_'+digest(root),root,common_dir}
 }
-export function within(root:string,path:string):boolean {const rel=relative(root,path);return rel===''||(!rel.startsWith('..'+sep)&&rel!=='..'&&!isAbsolute(rel))}
+export function within(root:string,path:string,platform:NodeJS.Platform=process.platform):boolean{return withinCanonical(root,path,platform)}
+/** Never silently rehash pre-scheme Windows rows into a second protected domain. */
+export function ensureWorkspaceIdentityScheme(store:Store,platform:NodeJS.Platform=process.platform):void {
+  if(platform!=='win32')return
+  const value=store.db.prepare("SELECT value FROM metadata WHERE key='windows_identity_scheme'").get()?.value
+  if(value==='canonical-components-v1')return
+  if(value!==undefined||store.db.prepare('SELECT 1 FROM workspaces LIMIT 1').get())fail('STORAGE_ERROR','Existing Windows workspace identities need an explicit offline migration; canonical spelling must not silently create a second collaboration domain.',{recovery_action:'Stop participating sessions, preserve the existing database/history, and use an audited identity migration. Do not delete old rows or reset the domain.'})
+  store.db.prepare("INSERT INTO metadata(key,value) VALUES('windows_identity_scheme','canonical-components-v1')").run()
+}
 export interface RegisterRequest {session_id:string;cwd:string;project_root?:string;title?:string;task_summary?:string;expected_previous_incarnation?:string;takeover_authorized?:boolean}
 /** Session ownership is an atomic logical-session CAS, independent of heartbeat presence. */
 export class Identities {
-  constructor(readonly store:Store, readonly config:Config){}
+  constructor(readonly store:Store, readonly config:Config){initializeHostStateReservations(store)}
   register(request:RegisterRequest):RuntimeIdentity {
     const context=resolveProject(request.cwd,request.project_root)
-    const physicalDataDir=realpathSync(this.config.data_dir)
+    const physicalDataDir=canonicalExistingDirectory(this.config.data_dir)
     if(within(context.root,physicalDataDir)||within(physicalDataDir,context.root))fail('PATH_NOT_ALLOWED','Coordinator storage and protected workspace must not overlap.')
-    const machine=machineInstanceDirectory(),physicalMachine=resolve(realpathSync(dirname(machine)),basename(machine))
+    const machine=machineInstanceDirectory(),physicalMachine=existsSync(machine)?canonicalExistingDirectory(machine):resolve(canonicalExistingDirectory(dirname(machine)),basename(machine))
     if(within(context.root,physicalMachine)||within(physicalMachine,context.root))fail('PATH_NOT_ALLOWED','The reserved coordinator instance-control directory must remain outside protected workspaces.')
     return this.store.transaction(()=>{
+      ensureWorkspaceIdentityScheme(this.store)
+      assertWorkspaceOutsideHostState(this.store,context.root)
       const overlaps=this.store.db.prepare('SELECT * FROM workspaces').all() as object as {id:string;project_id:string;root:string}[]
       for(const other of overlaps)if(other.id!==context.workspace_id&&(within(other.root,context.root)||within(context.root,other.root)))fail('WORKSPACE_OVERLAP','Protected workspaces physically overlap.',{root:context.root,existing_root:other.root})
       this.store.db.prepare('INSERT OR IGNORE INTO workspaces(id,project_id,root) VALUES(?,?,?)').run(context.workspace_id,context.project_id,context.root)

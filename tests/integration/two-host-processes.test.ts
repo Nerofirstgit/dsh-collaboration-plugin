@@ -1,7 +1,12 @@
 /**
- * UNRUN in the cloud sandbox: original Unix daemon transport cannot bind here.
+ * UNRUN in the cloud sandbox: original daemon transport cannot bind here.
  * This is an actual two-dsh-process test, not a loopback coordinator substitute.
  * A local Messages HTTP fixture replaces only the paid model endpoint.
+ * Uses production Unix sockets / native Windows named pipes; neither is replaced.
+ * Finite coverage: discovery, one boundary delivery, stale edit, two committed edits.
+ * Not packed-plugin installation, GUI boot, idle delivery, or daemon-crash acceptance.
+ * DSH_TEST_KEEP_ARTIFACTS=1 retains a successful run plus sanitized evidence.json.
+ * Retained private state includes runtime.key: never upload the whole directory.
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
@@ -15,6 +20,7 @@ import {fileURLToPath} from 'node:url'
 import {DatabaseSync} from 'node:sqlite'
 import {initProfile} from '@deepseek-ai/dsh-app-boot'
 import {CoordinatorClient} from '../../src/client.ts'
+import {fixtureEnvironment,fixtureLinkType,fixtureClientOptions,fixtureSummary,type FixtureDatabaseEvidence} from './fixture-runtime.ts'
 
 const repository=fileURLToPath(new URL('../..',import.meta.url))
 const model='deepseek-v4-flash'
@@ -27,10 +33,10 @@ function answer(response:ServerResponse,tool?:{name:string;input:Record<string,u
   response.writeHead(200,{'content-type':'text/event-stream'})
   response.end(events.map(event=>`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join(''))
 }
-function startHost(home:string,workspace:string,marker:string){
+function startHost(home:string,workspace:string,temp:string,marker:string){
   const cli=resolve(repository,'node_modules/@deepseek-ai/dsh/lib/bin.js')
   // Deliberately do not inherit any real credentials or unrelated project env.
-  const env={PATH:process.env.PATH,HOME:home,DSH_HOME:home,DSH_TELEMETRY_DISABLED:'1',DEEPSEEK_API_KEY:'local-fixture-not-a-secret',NO_PROXY:'127.0.0.1,localhost'}
+  const env=fixtureEnvironment(home,temp)
   const child=spawn(process.execPath,[cli,'--profile','collaboration-fixture','--json',marker],{cwd:workspace,env,stdio:['ignore','pipe','pipe']})
   let stdout='',stderr='',buffer='';const session=deferred<string>()
   child.stdout!.on('data',chunk=>{const text=String(chunk);stdout+=text;buffer+=text;let i:number;while((i=buffer.indexOf('\n'))>=0){const line=buffer.slice(0,i);buffer=buffer.slice(i+1);try{const event=JSON.parse(line);if(event.type==='session')session.resolve(event.sessionId)}catch{/* ordinary diagnostics are retained */}}})
@@ -42,15 +48,13 @@ function startHost(home:string,workspace:string,marker:string){
 
 test('two real pinned Harness processes discover, deliver at a boundary, reject stale edit, and preserve both writers',{timeout:120000},async(t)=>{
   assert.ok(existsSync(join(repository,'lib/plugin.js')),'Run npm run build before the process acceptance test.')
-  const dir=mkdtempSync(join(tmpdir(),'dsh-two-host-')),home=join(dir,'home'),workspace=join(dir,'project'),data=join(dir,'coordinator')
-  mkdirSync(workspace);mkdirSync(home);writeFileSync(join(workspace,'shared.txt'),'base\n')
+  const dir=mkdtempSync(join(tmpdir(),'dsh-two-host-')),home=join(dir,'home'),workspace=join(dir,'project'),data=join(dir,'coordinator'),temp=join(dir,'tmp')
+  mkdirSync(workspace);mkdirSync(home);mkdirSync(temp);if(process.platform==='win32'){mkdirSync(join(home,'AppData','Roaming'),{recursive:true});mkdirSync(join(home,'AppData','Local'),{recursive:true})}writeFileSync(join(workspace,'shared.txt'),'base\n')
   const profile=join(home,'profiles','collaboration-fixture')
-  initProfile(profile,['@deepseek-ai/dsh-base','@deepseek-ai/dsh-headless','@nerofirstgit/dsh-collaboration'])
-  const manifest=JSON.parse(readFileSync(join(profile,'package.json'),'utf8'));manifest.dependencies={'@nerofirstgit/dsh-collaboration':`file:${repository}`};writeFileSync(join(profile,'package.json'),JSON.stringify(manifest))
-  mkdirSync(join(profile,'node_modules','@nerofirstgit'),{recursive:true});symlinkSync(repository,join(profile,'node_modules','@nerofirstgit','dsh-collaboration'))
   const bothRead=deferred<void>(),messageCommitted=deferred<void>(),aExited=deferred<void>();let reads=0,bId=''
   const requests:{peer:string;phase:number;body:unknown}[]=[];const counts={A:0,B:0};let endpointFailure:unknown
-  const children:ChildProcess[]=[];let client:CoordinatorClient|undefined,daemonPid:number|undefined,completed=false
+  const children:ChildProcess[]=[];let client:CoordinatorClient|undefined,daemonPid:number|undefined,completed=false,stored:FixtureDatabaseEvidence|undefined
+  const keepArtifacts=process.env.DSH_TEST_KEEP_ARTIFACTS==='1'
   const server=createServer((request,response)=>{void(async()=>{
     const chunks:Buffer[]=[];for await(const chunk of request)chunks.push(Buffer.from(chunk))
     assert.ok(request.url?.endsWith('/v1/messages'),'Only the local Messages API is allowed')
@@ -70,21 +74,27 @@ test('two real pinned Harness processes discover, deliver at a boundary, reject 
     throw new Error(`Unexpected model boundary ${peer}:${phase}`)
   })().catch(error=>{endpointFailure=error;bothRead.reject(error);messageCommitted.reject(error);aExited.reject(error);response.destroy(error as Error)})})
   try{
+    initProfile(profile,['@deepseek-ai/dsh-base','@deepseek-ai/dsh-headless','@nerofirstgit/dsh-collaboration'])
+    const manifest=JSON.parse(readFileSync(join(profile,'package.json'),'utf8'));manifest.dependencies={'@nerofirstgit/dsh-collaboration':`file:${repository}`};writeFileSync(join(profile,'package.json'),JSON.stringify(manifest))
+    mkdirSync(join(profile,'node_modules','@nerofirstgit'),{recursive:true});symlinkSync(repository,join(profile,'node_modules','@nerofirstgit','dsh-collaboration'),fixtureLinkType())
     server.listen(0,'127.0.0.1');await once(server,'listening');const address=server.address();assert.ok(address&&typeof address!=='string')
     writeFileSync(join(profile,'cordis.patch.yml'),`- id: session-collaboration\n  config:\n    data_dir: ${JSON.stringify(data)}\n    workspace_root: ${JSON.stringify(workspace)}\n    communication_policy: same_project_enabled\n- id: llm-deepseek\n  config:\n    baseURL: http://127.0.0.1:${address.port}/anthropic\n    thinking: disabled\n    reasoningEffort: off\n    maxTokens: 1000\n- id: agent-default-model\n  config:\n    provider: deepseek-official\n    model: ${model}\n`)
-    const b=startHost(home,workspace,'HARNESS_FIXTURE_B');children.push(b.child);bId=await bounded(b.session,20000,'B session registration')
-    const a=startHost(home,workspace,'HARNESS_FIXTURE_A');children.push(a.child);await bounded(a.session,20000,'A session registration')
+    const b=startHost(home,workspace,temp,'HARNESS_FIXTURE_B');children.push(b.child);bId=await bounded(b.session,20000,'B session registration')
+    const a=startHost(home,workspace,temp,'HARNESS_FIXTURE_A');children.push(a.child);await bounded(a.session,20000,'A session registration')
     assert.notEqual(a.child.pid,b.child.pid)
     await bounded(a.done,40000,'A terminal result');aExited.resolve()
     await bounded(b.done,40000,'B terminal result');if(endpointFailure)throw endpointFailure
     assert.equal(readFileSync(join(workspace,'shared.txt'),'utf8'),'base\nA\nB\n')
     const db=new DatabaseSync(join(data,'coordinator.sqlite'),{readOnly:true})
-    try{assert.equal(db.prepare('SELECT COUNT(*) n FROM messages').get()!.n,1);assert.equal(db.prepare('SELECT delivery_state FROM messages').get()!.delivery_state,'delivered');assert.ok(Number(db.prepare('SELECT COUNT(*) n FROM context_deliveries').get()!.n)>0);assert.equal(db.prepare("SELECT COUNT(*) n FROM file_mutations WHERE state='committed'").get()!.n,2)}finally{db.close()}
+    try{
+      stored={messages:Number(db.prepare('SELECT COUNT(*) n FROM messages').get()!.n),delivered_messages:Number(db.prepare("SELECT COUNT(*) n FROM messages WHERE delivery_state='delivered'").get()!.n),context_deliveries:Number(db.prepare('SELECT COUNT(*) n FROM context_deliveries').get()!.n),committed_file_mutations:Number(db.prepare("SELECT COUNT(*) n FROM file_mutations WHERE state='committed'").get()!.n)}
+      assert.equal(stored.messages,1);assert.equal(stored.delivered_messages,1);assert.ok(stored.context_deliveries>0);assert.equal(stored.committed_file_mutations,2)
+    }finally{db.close()}
     assert.equal(requests.filter(r=>r.peer==='A').length,5);assert.equal(requests.filter(r=>r.peer==='B').length,5)
     completed=true
   }finally{
     for(const child of children)if(child.exitCode===null&&child.signalCode===null)child.kill('SIGTERM')
-    if(existsSync(join(data,'runtime.key'))){try{client=new CoordinatorClient({socket_path:join(data,'coordinator.sock'),admin_token:readFileSync(join(data,'runtime.key'),'utf8').trim(),timeout_ms:1000});const ping=await client.call('ping') as {pid:number};daemonPid=ping.pid}catch{/* retain failure diagnostics */}finally{client?.close()}}
+    if(existsSync(join(data,'runtime.key'))){try{client=new CoordinatorClient(fixtureClientOptions(data,readFileSync(join(data,'runtime.key'),'utf8').trim()));const ping=await client.call('ping') as {pid:number};assert.ok(Number.isSafeInteger(ping.pid)&&ping.pid>0&&ping.pid!==process.pid,'Only the authenticated fixture daemon may be stopped');daemonPid=ping.pid}catch{/* retain failure diagnostics */}finally{client?.close()}}
     if(daemonPid)try{process.kill(daemonPid,'SIGTERM')}catch{/* already stopped */}
     await new Promise<void>(resolve=>{server.close(()=>resolve());server.closeAllConnections()})
     // Wait for spawned hosts to release only their own temporary profile files.
@@ -94,7 +104,10 @@ test('two real pinned Harness processes discover, deliver at a boundary, reject 
     let daemonStopped=!existsSync(join(data,'runtime.key'))
     if(daemonPid)for(let attempt=0;attempt<100;attempt++){try{process.kill(daemonPid,0)}catch(error){if((error as NodeJS.ErrnoException).code==='ESRCH'){daemonStopped=true;break}throw error}await new Promise(resolve=>setTimeout(resolve,50))}
     const hostsStopped=children.every(child=>child.exitCode!==null||child.signalCode!==null)
-    if(completed&&hostsStopped&&daemonStopped)rmSync(dir,{recursive:true,force:true})
-    else t.diagnostic(`Fixture evidence retained at ${dir}; completed=${completed}, hostsStopped=${hostsStopped}, daemonStopped=${daemonStopped}`)
+    const evidence=fixtureSummary({completed,counts,stored,hostsStopped,daemonStopped,keepArtifacts})
+    writeFileSync(join(dir,'evidence.json'),JSON.stringify(evidence,null,2)+'\n',{mode:0o600})
+    t.diagnostic(`Fixture summary: ${JSON.stringify(evidence)}`)
+    if(!evidence.artifacts_retained)rmSync(dir,{recursive:true,force:true})
+    else t.diagnostic(`Fixture evidence retained at ${dir}; share only evidence.json and reviewed TAP, never runtime.key or the whole directory`)
   }
 })

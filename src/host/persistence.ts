@@ -14,12 +14,24 @@ import {
 } from '@deepseek-ai/dsh-session-persistence'
 import type { CoordinatorClient } from '../client.ts'
 import type { RuntimeIdentity } from '../types.ts'
+import { CoordinationError } from '../errors.ts'
 import { restorePendingToolResults } from './recovery.ts'
 
 /** Only the authenticated coordinator call capability crosses the adapter. */
 export type HostCoordinatorTransport = Pick<CoordinatorClient, 'call'>
-/** Trusted fallback for sessions whose original header has no working directory. */
-export interface HostPersistenceOptions { workspaceRoot: string }
+/** Trusted internal admission facts; never accepted from model/schema/RPC input. */
+export interface HostSessionAdmission {
+  operation:'create'|'open'
+  header:SessionHeader
+  /** Create: explicit deployment root if configured. Open: required original persisted workspace root. */
+  workspaceRoot?:string
+}
+/** Optional explicit single-workspace deployment; otherwise the trusted SessionHeader.cwd selects its own project. */
+export interface HostPersistenceOptions {
+  workspaceRoot?:string
+  /** Synchronous GUI location/config check before every create/write-open transport attempt. */
+  admitSession?:(request:HostSessionAdmission)=>void
+}
 
 /** Parse a wire object before trusting any returned identifiers. */
 export function wireObject(value: unknown, name: string): Record<string, unknown> {
@@ -74,6 +86,7 @@ function rethrowHost(error: unknown,id:SessionId,activeHandle=false): never {
 }
 
 interface PendingAppend { id:string; fingerprint:string; events:readonly SessionEvent[]; expected:number; fromBuffer:boolean }
+interface PreparedOpen {params:Record<string,unknown>;admission?:HostSessionAdmission}
 /** One private handle; live events and explicit appends share one serialized drain. */
 class CoordinatorSessionHandle implements SessionHandle {
   readonly id:SessionId
@@ -236,16 +249,30 @@ export class CoordinationSessionPersistence extends SessionPersistence {
     const h=this.writers.get(id);if(!h)throw new SessionOwnershipLostError(id)
     return h.eventCount
   }
-  private async openRequest(id:SessionId,access:SessionAccess,method:string,base:Record<string,unknown>,prepare?:()=>Promise<Record<string,unknown>>):Promise<SessionHandle> {
+  private admitSession(request:HostSessionAdmission):void {
+    const result:unknown=this.options.admitSession?.(request)
+    if(result!==null&&(typeof result==='object'||typeof result==='function')&&typeof (result as {then?:unknown}).then==='function'){
+      // TypeScript's void callback permits async functions. Refuse them before
+      // dispatch, while consuming a rejected Promise to avoid an unhandled rejection.
+      void Promise.resolve(result).catch(()=>undefined)
+      throw new CoordinationError('UNMEDIATED_WRITE_DENIED','Session admission must complete synchronously before creating a write owner.')
+    }
+  }
+  private async openRequest(id:SessionId,access:SessionAccess,method:string,base:Record<string,unknown>,prepare?:()=>Promise<PreparedOpen>):Promise<SessionHandle> {
     const key=`${access}:${id}`,fingerprint=JSON.stringify({method,...base})
     if(this.opening.has(key))throw new SessionAlreadyOwnedError(id)
     const prior=this.pendingOpens.get(key)
     if(prior&&prior.fingerprint!==fingerprint)throw new Error('A pending session open has an unresolved outcome; retry the original request')
     this.opening.add(key)
     try{
+      // Revalidate even a retained uncertain request. The fresh preparation's
+      // CAS is used only for a new request, never substituted into a replay.
+      const prepared=await prepare?.()
+      // No await between the final synchronous GUI check and transport call.
+      if(prepared?.admission)this.admitSession(prepared.admission)
       let request=prior
       if(!request){
-        request={method,fingerprint,params:{...base,...await prepare?.(),open_request_id:randomUUID()}}
+        request={method,fingerprint,params:{...base,...prepared?.params,open_request_id:randomUUID()}}
         this.pendingOpens.set(key,request)
       }
       let response:unknown
@@ -259,7 +286,9 @@ export class CoordinationSessionPersistence extends SessionPersistence {
         // A definitive stale-CAS reply (never AlreadyOwned) permits one new
         // owner CAS. The daemon still refuses every connected live writer.
         if(prior&&method==='session_open'&&fields.code==='STALE_INSTANCE'&&details.host_error===undefined){
-          request={method,fingerprint,params:{...base,...await prepare?.(),open_request_id:randomUUID()}}
+          const refreshed=await prepare?.()
+          if(refreshed?.admission)this.admitSession(refreshed.admission)
+          request={method,fingerprint,params:{...base,...refreshed?.params,open_request_id:randomUUID()}}
           this.pendingOpens.set(key,request)
           try{response=await this.transport.call(request.method,request.params)}
           catch(retryError){
@@ -276,9 +305,11 @@ export class CoordinationSessionPersistence extends SessionPersistence {
   }
   async create(header:SessionHeader,options?:SessionPersistenceCreateOptions):Promise<SessionHandle> {
     options?.signal?.throwIfAborted()
-    const canonical=materializeCreateHeader(header)
+    const canonical=parseHeader(materializeCreateHeader(header))
     if(this.writers.has(header.id))throw new SessionAlreadyExistsError(header.id)
-    try{return await this.openRequest(header.id,'write','session_create',{header:canonical,inherited_event_count:options?.inheritedEventCount??0,workspace_root:this.options.workspaceRoot})}
+    try{return await this.openRequest(header.id,'write','session_create',{header:canonical,inherited_event_count:options?.inheritedEventCount??0,...this.options.workspaceRoot===undefined?{}:{workspace_root:this.options.workspaceRoot}},async()=>{
+      return{params:{},admission:{operation:'create',header:canonical,workspaceRoot:this.options.workspaceRoot}}
+    })}
     catch(error){return rethrowHost(error,header.id)}
   }
   async open(id:SessionId,access:SessionAccess,options?:SessionPersistenceOpenOptions):Promise<SessionHandle> {
@@ -287,8 +318,16 @@ export class CoordinationSessionPersistence extends SessionPersistence {
     try{
       const handle=await this.openRequest(id,access,'session_open',{id,access},async()=>{
         const previous=access==='write'?await this.transport.call('session_stat',{id}):null
-        const expected=previous===null?undefined:wireObject(previous,'session stat').previous_incarnation
-        return expected===undefined?{}:{expected_previous_incarnation:wireString(expected,'previous_incarnation')}
+        const metadata=previous===null?undefined:wireObject(previous,'session stat')
+        let admission:HostSessionAdmission|undefined
+        if(access==='write'&&this.options.admitSession){
+          if(!metadata)throw new SessionPersistenceNotFoundError(id)
+          const header=parseHeader(metadata.header),workspaceRoot=wireString(metadata.workspace_root,'session stat.workspace_root')
+          if(header.id!==id||!isAbsolute(workspaceRoot))throw new CoordinationError('UNMEDIATED_WRITE_DENIED','Write-open admission requires the requested session header and its original absolute workspace root.')
+          admission={operation:'open',header,workspaceRoot}
+        }
+        const expected=metadata?.previous_incarnation
+        return{params:expected===undefined?{}:{expected_previous_incarnation:wireString(expected,'previous_incarnation')},admission}
       })
       if(access==='write'){
         try{await restorePendingToolResults(handle,this.transport,this.runtimeIdentity(id))}

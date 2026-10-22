@@ -1,17 +1,18 @@
 # Installation and safe operation
 
+> **2026-10-22 correction in progress:** native Windows and portable Node APIs are the target; only cooperating enabled dsh sessions are in scope. The current implementation and remaining Windows/GUI gates are in [gui-candidate.md](gui-candidate.md). Linux-specific descriptions and old test counts below are historical, not claims about the correction.
+
 ## Release status and prerequisites
 
 This is a **development plugin bundle**, not a completed P0 release or a standalone application. Build/pack success does not establish real host startup, transport, enforcement, or two-process acceptance. Read [the acceptance matrix](acceptance-matrix.md) and [enabled-only scope](scope-revision.md) before using a non-disposable workspace.
 
-Supported target for development:
+Development target and restrictions:
 
-- Linux, Node **24+**; cloud tests used Node 24.19.0. The writer requires `/proc/self/fd` and Linux descriptor semantics. macOS/Windows/network filesystems are not certified.
-- DeepSeek Harness **0.2.1-rc.2**, official commit `687f282e8625c6b8d11ff58211a90524be2e4317`. Do not use a floating host version. The runtime profile also verifies its enabled package versions.
-- `pnpm` on `PATH` for the host plugin command. The pinned upstream workspace declares `pnpm@11.28.5`.
-- A private, owned, non-symlink coordinator directory **outside every participating project/workspace**. All participating host processes must use the same directory and coordinator configuration. Do not use a network share or copy a live database into a second domain.
-- One active coordinator per Linux OS user/mount namespace. A fixed kernel election guard additionally refuses concurrent profiles using different state directories. Do not unlink `/tmp/dsh-collaboration-instance-UID/coordinator.lock` to bypass a live owner. Different users/containers sharing files are not certified participants.
-- A fresh headless profile containing only the audited entries in [`src/host/profile.ts`](../src/host/profile.ts). Browser/API terminals, MCP, LSP, shell/subprocess tools, dynamic host loading, plugin/config hot editing, external tools, and tool-result pruning are not supported in this composition.
+- Native Windows is the requested target; cloud evidence was obtained on Linux/Node 24.19.0. Node >=24 is required. Actual Windows and full GUI acceptance remain pending; no WSL substitution is implied.
+- DeepSeek Harness **0.2.1-rc.2**, source `687f282e8625c6b8d11ff58211a90524be2e4317`, exact package identities/versions. Do not silently upgrade or downgrade the user's installation.
+- A supported pnpm environment for the official `dsh plugin ... add` command; do not automatically install global tooling or enable package lifecycle scripts.
+- All participating hosts share one coordinator directory outside every project. A separate lifetime SQLite election is fixed to `os.userInfo().homedir/.dsh-collaboration-instance`, independent of DSH_HOME/TEMP. Do not delete any election database/journal to bypass an owner.
+- The headless baseline below remains available. The distinct GUI candidate requires the generated reviewed overlay; see [the Windows native handoff](Windows原生候选版测试交接.md) for actual UTF-8 CLI commands, official packed installation and separate Web/Desktop gates. Do not install into a production profile while those gates remain open.
 
 The development repository is private: [Nerofirstgit/dsh-collaboration-plugin](https://github.com/Nerofirstgit/dsh-collaboration-plugin). Repository access is not npm publication, and a WIP branch is not a release. No remote package registry publication or deployment is implied.
 
@@ -30,7 +31,7 @@ npm pack
 
 The expected archive name at version `0.1.0-dev.0` is `nerofirstgit-dsh-collaboration-0.1.0-dev.0.tgz`. Inspect `npm pack --dry-run` before distributing it: the package should contain compiled `lib`, the profile bundle patch, documentation and license, not databases, runtime keys, test workspaces, `node_modules`, or the upstream checkout. `private: true` intentionally prevents accidental npm publication; it does not prevent local tarball installation.
 
-The native kernel-lock dependency must load successfully on the target platform. Do not weaken the lock or switch to PID/mtime/heartbeat ownership if it does not. The pinned `koffi@3.1.1` dependency provides the fixed in-process libc binding for ordinary no-overwrite rename; a system without `renameat2(RENAME_NOREPLACE)` support explicitly refuses that operation. It never substitutes a shell/helper or copy/delete sequence. Dependencies and build scripts remain trusted code; this guide does not authorize installing or executing arbitrary packages.
+The plugin now uses portable Node filesystem/IPC operations and separate SQLite lifetime election, not `/proc` paths, `flock`, `koffi` or `renameat2`. This preserves exclusion among cooperating participants, not arbitrary external-program prevention. Windows directory fsync/whole-machine power-loss durability and ACL isolation are not certified. Official host dependencies may retain their own native components. Never weaken a failed identity/lock check or substitute raw shell/copy-delete writes.
 
 ## Install into an isolated headless profile
 

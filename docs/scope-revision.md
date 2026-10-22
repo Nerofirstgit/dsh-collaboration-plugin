@@ -1,12 +1,34 @@
 # Revised protection scope: enabled, audited headless participants
 
+## 2026-10-22: Windows target and cooperating-dsh scope supersede platform/security assumptions below
+
+The user explicitly clarified that **dsh means DeepSeek Harness**, normal use is **native Windows**, and platform-neutral Node/runtime APIs must be the default. Linux-only implementation is a compatibility defect in this checkpoint, not a host limitation. WSL is not a substitute for the requested Windows acceptance. Desktop/Web compatibility is a separate required integration gate; the existing headless-only composition does not establish it.
+
+The user further narrowed the guarantee: **coordinate multiple enabled dsh sessions; do not prevent other programs or human editors from changing files**. This supersedes the original requirement for adversarial external filesystem race prevention. Preserve version/hash checks and useful best-effort conflict detection, but do not describe them as an OS sandbox or atomic expected-version CAS against external actors. No native hardening backend is required merely to defend excluded external programs.
+
+Still mandatory within participating dsh sessions:
+- One effective coordinator writer; a paused owner cannot be bypassed by deleting an election file or expiring a heartbeat.
+- Stable identities, monotonic epochs/fences, serialized managed writes, read receipts and version checks.
+- Durable mutation intent before publication, idempotent operation IDs and evidence-based recovery after an uncertain result; no raw-write fallback.
+- dsh-invoked shell, MCP, subagent, workflow or plugin tool paths must be mediated or explicitly denied. They are not classified as excluded external applications merely because they spawn a process.
+- Only the complete unloaded/disabled plugin is outside the collaboration guarantee, as the earlier R02 revision already states.
+
+The implementation branch `codex/windows-portable-coordination` is replacing Linux-specific primitives with Node filesystem/local-IPC APIs and an independent SQLite lifetime election transaction. The election DB must be separate from application Store, acquired before epoch/recovery, retained until all writer work stops, and never deleted/recreated to force takeover. This is work in progress, not a claim of completed Windows or GUI support.
+
+The historical details below describe the earlier pinned headless implementation. They remain useful evidence for model/tool boundaries, but Linux-only and adversarial-external-file-defense assumptions are superseded by this section. Acceptance entries must distinguish revised out-of-scope external-actor scenarios from still-required dsh cooperation scenarios; existing passing tests are not automatically Windows acceptance.
+
+
 The user clarified during development that **disabling/unloading the plugin need not preserve collaboration or protection**. That supersedes the original document's requirement that a disabled participant remain read-only while another participant remains protected. No upstream patch has been authorized or applied. Existing durable history and unresolved-operation evidence must still be retained; disabling is not an instruction to delete records or invent terminal outcomes.
 
 This change makes a useful unchanged-host plugin feasible. It does **not** authorize a claim that an ordinary JavaScript plugin confines every installed Host package or arbitrary external process.
 
-## Supported target composition
+## Current portable GUI candidate
 
-The supported target is a **cold-start, pinned, audited headless profile** built from official `dsh-base` + `dsh-headless` at `0.2.1-rc.2`, with the collaboration bundle applied and its required safety restrictions intact. Every model-facing write while enabled must either go through the coordinated writer or return an explicit denial.
+The latest source adds an independently checked Web/Desktop composition and guarded actual stock controller. See [gui-candidate.md](gui-candidate.md) for runtime boundaries and remaining native/UI gates. It is not a wildcard expansion of the headless allowlist or a Windows acceptance claim.
+
+## Original headless target composition (retained baseline)
+
+The original headless baseline is a **cold-start, pinned, audited headless profile** built from official `dsh-base` + `dsh-headless` at `0.2.1-rc.2`, with the collaboration bundle applied and its required safety restrictions intact. Every model-facing write while enabled must either go through the coordinated writer or return an explicit denial.
 
 The minimal enabled-mode composition requires:
 

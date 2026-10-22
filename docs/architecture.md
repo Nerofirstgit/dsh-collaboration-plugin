@@ -1,5 +1,7 @@
 # Architecture and trust boundaries
 
+> **2026-10-22 correction in progress:** native Windows and portable Node APIs are the target; only cooperating enabled dsh sessions are in scope. The current implementation and remaining Windows/GUI gates are in [portable-checkpoint.md](portable-checkpoint.md). Linux-specific descriptions and old test counts below are historical, not claims about the correction.
+
 ## Real host plugin, one private authority
 
 ```text
