@@ -4,3 +4,6 @@ upstream/
 *.tgz
 .tmp/
 coverage/
+
+# Local handoff and internal project notes
+/docs/

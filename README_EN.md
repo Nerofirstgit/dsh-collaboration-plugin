@@ -25,9 +25,9 @@ You create independent sessions and assign tasks in Harness as usual. Participat
 
 This is an installable **Cordis / dsh plugin bundle**. Version `0.1.0-dev.0` is a development candidate; full release acceptance is still incomplete.
 
-> This README also records progress in the local development candidate. Related source changes and documents marked “local, pending commit” are not included in this documentation-only commit. Builds from the current GitHub snapshot may not yet include those features or validation records.
+> This README also records progress in the local development candidate. Related source changes have not all been pushed. Builds from the current GitHub snapshot may not yet include those features.
 
-**Navigation:** [Highlights](#highlights) · [Compatibility](#compatibility-and-validation) · [Installation](#installation) · [Usage](#usage) · [Configuration](#configuration) · [Limitations](#current-limitations) · [Development](#development-and-verification) · [Documentation](#documentation)
+**Navigation:** [Highlights](#highlights) · [Compatibility](#compatibility-and-validation) · [Installation](#installation) · [Usage](#usage) · [Configuration](#configuration) · [Limitations](#current-limitations) · [Development](#development-and-verification)
 
 ## Highlights
 
@@ -53,7 +53,7 @@ This is an installable **Cordis / dsh plugin bundle**. Version `0.1.0-dev.0` is 
 
 **Recorded validation includes:** native Windows component tests, two independent Harness processes coordinating over a real named pipe, installed-archive Web startup and asset checks, and local Desktop `0.2.0-rc.2` tests with real models covering discovery, messaging, file coordination, selected plugin coexistence, and native plugin management.
 
-These are finite scenarios, not certification of arbitrary host versions, plugins, or every crash-recovery path. Packages for `0.2.0-rc.2` and `0.2.1-rc.2` are not interchangeable; changing a version string does not establish compatibility. See the Windows retest (`docs/windows-local-retest.md` — local, pending commit), plugin coexistence (`docs/plugin-coexistence.md` — local, pending commit), and plugin management restoration (`docs/plugin-management-restoration.md` — local, pending commit) records.
+These are finite scenarios, not certification of arbitrary host versions, plugins, or every crash-recovery path. Packages for `0.2.0-rc.2` and `0.2.1-rc.2` are not interchangeable; changing a version string does not establish compatibility.
 
 ## Installation
 
@@ -72,7 +72,7 @@ npm pack --ignore-scripts --dry-run
 npm pack --ignore-scripts
 ```
 
-The current archive name is `nerofirstgit-dsh-collaboration-0.1.0-dev.0.tgz`. Because `--ignore-scripts` skips packaging lifecycle scripts, complete the explicit build above first. Check that the archive contains compiled files, bundle configuration, documentation, and licenses, without runtime keys, databases, or test workspaces.
+The current archive name is `nerofirstgit-dsh-collaboration-0.1.0-dev.0.tgz`. Because `--ignore-scripts` skips packaging lifecycle scripts, complete the explicit build above first. Check that the archive contains compiled files, bundle configuration, both READMEs, and licenses, without runtime keys, databases, or test workspaces.
 
 The repository declares `private: true`. Use a local archive built from trusted source; these instructions do not install a registry package.
 
@@ -100,9 +100,9 @@ After building, inspect the offline configuration tool:
 node lib/gui-configure.js --help
 ```
 
-The tool reads an official `--dump-config` output after the bundle is installed. It requires explicit `--surface`, `--home`, `--profile-dir`, and `--data-dir` values; `--host-version` defaults to `0.2.1-rc.2`. It creates a new configuration file without launching the application or modifying an existing profile. See [installation](docs/installation.md) and [GUI configuration](docs/gui-candidate.md) for the detailed procedure.
+The tool reads an official `--dump-config` output after the bundle is installed. It requires explicit `--surface`, `--home`, `--profile-dir`, and `--data-dir` values; `--host-version` defaults to `0.2.1-rc.2`. It creates a new configuration file without launching the application or modifying an existing profile. Generate the overlay using an isolated test home and profile, and inspect the final composed configuration before startup.
 
-Those documents retain earlier checkpoints, including statements about validation that was pending at the time. This README and subsequent topic records describe the current supported scope. Existing Desktop `0.2.0-rc.2` installations require their matching compatibility build and overlay.
+Existing Desktop `0.2.0-rc.2` installations require their matching compatibility build and overlay.
 
 ## Usage
 
@@ -189,19 +189,6 @@ npm run test:integration
 ```
 
 Integration tests use real processes and local IPC. Run them in isolation after confirming that no other coordinator occupies the account-level election. Fixtures use local fake models; Desktop tests with real models are recorded separately. Component checks, build success, and full release acceptance cover different scopes.
-
-## Documentation
-
-| Document | Contents |
-| --- | --- |
-| Automatic collaboration (`docs/automatic-collaboration.md` — local, pending commit) | Messaging, waiting, automatic merging, and existing-domain migration |
-| [Installation and upgrades](docs/installation.md) | Local packaging, isolated installation, disabling, and rollback |
-| [GUI configuration](docs/gui-candidate.md) | Web / Desktop overlays and runtime checks |
-| Windows local retest (`docs/windows-local-retest.md` — local, pending commit) | Native component, two-process, and installed Web test records |
-| Plugin coexistence (`docs/plugin-coexistence.md` — local, pending commit) | Supported adapter packages and remaining work |
-| Plugin management restoration (`docs/plugin-management-restoration.md` — local, pending commit) | Native installation, admission checks, and restart boundaries |
-| [Architecture](docs/architecture.md) · [Messaging](docs/messaging.md) · [File writes](docs/writer.md) | Design and implementation details |
-| [Scope revision](docs/scope-revision.md) · [Acceptance matrix](docs/acceptance-matrix.md) | Requirements and full acceptance checklist |
 
 ## Feedback and contributions
 
