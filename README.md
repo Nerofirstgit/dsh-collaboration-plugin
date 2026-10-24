@@ -27,7 +27,7 @@
 
 > 本 README 同时记录本地开发候选版的进展。相关源码变更尚未全部推送；从当前 GitHub 快照构建时，部分功能可能尚未包含。
 
-**导航：** [功能亮点](#功能亮点) · [兼容性](#兼容性与验证状态) · [安装](#安装) · [使用](#如何使用) · [配置](#配置) · [限制](#当前限制) · [开发](#开发与验证)
+**导航：** [功能亮点](#功能亮点) · [兼容性](#兼容性与验证状态) · [安装](#安装) · [使用](#如何使用) · [配置](#配置) · [限制](#当前限制) · [开发](#开发与验证) · [文档](#文档)
 
 ## 功能亮点
 
@@ -53,7 +53,7 @@
 
 **已记录的验证：** 原生 Windows 组件测试、两个独立 Harness 进程通过真实命名管道协作、安装归档后的 Web 启动与资源检查；本机 Desktop `0.2.0-rc.2` 的真实模型双会话发现、消息传递、文件协调，以及指定插件共存和原生插件管理流程。
 
-这些是有限场景的测试记录，不代表任意宿主版本、任意插件或全部崩溃恢复路径都已通过。`0.2.0-rc.2` 与 `0.2.1-rc.2` 的包不能混用，也不能只修改版本号来跳过检查。
+这些是有限场景的测试记录，不代表任意宿主版本、任意插件或全部崩溃恢复路径都已通过。`0.2.0-rc.2` 与 `0.2.1-rc.2` 的包不能混用，也不能只修改版本号来跳过检查。详见 [Windows 本地复测](docs/windows-local-retest.md)、[插件共存](docs/plugin-coexistence.md)和[插件管理恢复](docs/plugin-management-restoration.md)。
 
 ## 安装
 
@@ -72,7 +72,7 @@ npm pack --ignore-scripts --dry-run
 npm pack --ignore-scripts
 ```
 
-当前归档名为 `nerofirstgit-dsh-collaboration-0.1.0-dev.0.tgz`。`--ignore-scripts` 跳过打包生命周期，因此须先完成上面的显式构建。检查归档只包含编译文件、bundle 配置、两份 README 和许可证，不包含运行密钥、数据库或测试工作区。
+当前归档名为 `nerofirstgit-dsh-collaboration-0.1.0-dev.0.tgz`。`--ignore-scripts` 跳过打包生命周期，因此须先完成上面的显式构建。检查归档只包含编译文件、bundle 配置、文档和许可证，不包含运行密钥、数据库或测试工作区。
 
 仓库声明了 `private: true`，请使用可信源码生成的本地归档；本文不提供 npm 注册表安装方式。
 
@@ -100,9 +100,9 @@ GUI 需要在官方 `web` 或 `desktop` 配置基础上应用生成的专用 ove
 node lib/gui-configure.js --help
 ```
 
-工具读取安装 bundle 后的官方 `--dump-config` 输出，需要明确指定 `--surface`、`--home`、`--profile-dir`、`--data-dir`；`--host-version` 默认 `0.2.1-rc.2`。它只生成新的配置文件，不会启动应用或修改现有 profile。请使用隔离的测试 home 和 profile 生成 overlay，并在启动前核对最终组合配置。
+工具读取安装 bundle 后的官方 `--dump-config` 输出，需要明确指定 `--surface`、`--home`、`--profile-dir`、`--data-dir`；`--host-version` 默认 `0.2.1-rc.2`。它只生成新的配置文件，不会启动应用或修改现有 profile。具体步骤见 [安装说明](docs/installation.md) 和 [GUI 配置说明](docs/gui-candidate.md)。
 
-已有 Desktop `0.2.0-rc.2` 安装需要匹配的兼容构建和 overlay。
+上述文档保留了早期检查点，部分“尚未验证”描述属于当时状态；当前支持范围以本 README 和后续专题记录为准。已有 Desktop `0.2.0-rc.2` 安装需要匹配的兼容构建和 overlay。
 
 ## 如何使用
 
@@ -189,6 +189,19 @@ npm run test:integration
 ```
 
 集成测试涉及真实进程和本地 IPC，应在隔离环境中执行，并先确认没有其他协调实例占用账号级选举。测试夹具使用本地模拟模型；真实模型 Desktop 测试属于单独的验证记录。组件通过、构建成功和完整发布验收是不同的检查范围。
+
+## 文档
+
+| 文档 | 内容 |
+| --- | --- |
+| [自动协作](docs/automatic-collaboration.md) | 消息、等待、自动合并及旧协调域迁移 |
+| [安装与升级](docs/installation.md) | 本地打包、隔离安装、停用和回退 |
+| [GUI 配置](docs/gui-candidate.md) | Web / Desktop overlay 与运行时检查 |
+| [Windows 本地复测](docs/windows-local-retest.md) | 原生组件、双进程和已安装 Web 测试记录 |
+| [插件共存](docs/plugin-coexistence.md) | 指定适配包的功能范围与剩余工作 |
+| [插件管理恢复](docs/plugin-management-restoration.md) | 原生安装入口、准入检查和重启边界 |
+| [架构](docs/architecture.md) · [消息](docs/messaging.md) · [文件写入](docs/writer.md) | 设计与实现细节 |
+| [范围修订](docs/scope-revision.md) · [验收矩阵](docs/acceptance-matrix.md) | 需求范围和完整验收清单 |
 
 ## 反馈与贡献
 

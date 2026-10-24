@@ -5,5 +5,16 @@ upstream/
 .tmp/
 coverage/
 
-# Local handoff and internal project notes
-/docs/
+# Keep internal notes local; publish only documents linked from the README
+/docs/*
+!/docs/automatic-collaboration.md
+!/docs/installation.md
+!/docs/gui-candidate.md
+!/docs/windows-local-retest.md
+!/docs/plugin-coexistence.md
+!/docs/plugin-management-restoration.md
+!/docs/architecture.md
+!/docs/messaging.md
+!/docs/writer.md
+!/docs/scope-revision.md
+!/docs/acceptance-matrix.md
