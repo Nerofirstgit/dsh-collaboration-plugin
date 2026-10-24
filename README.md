@@ -207,8 +207,6 @@ npm run test:integration
 
 欢迎通过 [GitHub Issues](https://github.com/Nerofirstgit/dsh-collaboration-plugin/issues) 反馈问题或提交 Pull Request。请附上宿主和插件版本、操作系统、复现步骤，以及去除凭据和私有会话内容后的日志。修改涉及宿主、文件写入或第三方插件时，请注明实际测试的平台与功能范围。
 
-README 的双语入口与展示结构参考了 [dsh-our-free-model](https://github.com/Ebony-Vinyl/dsh-our-free-model)，功能与安装说明以本仓库实现为准。
-
 ## 许可证
 
 [MIT](LICENSE) · Copyright © 2026 Nerofirstgit

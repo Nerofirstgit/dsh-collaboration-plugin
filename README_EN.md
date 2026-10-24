@@ -207,8 +207,6 @@ Integration tests use real processes and local IPC. Run them in isolation after 
 
 Report issues through [GitHub Issues](https://github.com/Nerofirstgit/dsh-collaboration-plugin/issues) or submit a pull request. Include host and plugin versions, your operating system, reproduction steps, and logs with credentials and private conversation content removed. For changes involving hosts, file writes, or third-party plugins, state the platforms and features actually tested.
 
-The bilingual README entry points and presentation structure were inspired by [dsh-our-free-model](https://github.com/Ebony-Vinyl/dsh-our-free-model). Features and installation instructions describe this repository's implementation.
-
 ## License
 
 [MIT](LICENSE) · Copyright © 2026 Nerofirstgit
